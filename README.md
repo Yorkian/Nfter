@@ -64,10 +64,10 @@ sudo nfter
 
 ```
 ┌──────┬──────┬───────────────┬───────────────────┬───────────────┬──────────────────┬────────┐
-│ 编号 │ 协议 │   本地端口    │     目标地址      │   目标端口    │       流量       │ IP版本 │
+│ 编号  │ 协议  │   本地端口     │     目标地址       │   目标端口     │       流量        │ IP版本  │
 ├──────┼──────┼───────────────┼───────────────────┼───────────────┼──────────────────┼────────┤
-│  1   │ TCP  │ 40000-49999   │ 163.223.124.40    │ 40000-49999   │ 21.4K包/1.3 MB   │  IPv4  │
-│  2   │ UDP  │ 40000-49999   │ 163.223.124.40    │ 40000-49999   │ 1.2K包/188.6 KB  │  IPv4  │
+│  1   │ TCP  │ 40000-49999   │ 169.203.124.60    │ 40000-49999   │ 21.4K包/1.3 MB   │  IPv4  │
+│  2   │ UDP  │ 40000-49999   │ 169.203.124.60    │ 40000-49999   │ 1.2K包/188.6 KB  │  IPv4  │
 │  3   │ TCP  │    61888      │ example.com       │    15888      │ 7.1K包/440.9 KB  │  IPv4  │
 │  4   │ UDP  │    61888      │ example.com       │    15888      │ 4.8K包/726.5 KB  │  IPv4  │
 └──────┴──────┴───────────────┴───────────────────┴───────────────┴──────────────────┴────────┘
@@ -177,24 +177,10 @@ sudo nft list table ip nat
 sudo nft -f /etc/nftables.conf
 ```
 
-## 从旧版本升级
-
-如果之前安装的是 `nft-portforward`，可以：
+## 卸载
 
 ```bash
-# 停止旧服务
-sudo systemctl stop nft-portforward
-sudo systemctl disable nft-portforward
-
-# 删除旧服务文件
-sudo rm /etc/systemd/system/nft-portforward.service
-sudo rm /usr/local/bin/nft-portforward
-
-# 安装新版本
-sudo bash install.sh
-
-# 迁移域名配置（如果有）
-sudo mv /etc/nft-portforward/domains.json /etc/nfter/
+sudo nfter.sh -uninstall
 ```
 
 ## 注意事项
