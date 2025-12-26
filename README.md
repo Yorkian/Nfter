@@ -28,7 +28,12 @@
 ## 快速安装
 
 ```bash
-sudo bash install.sh
+# 一键安装并运行
+curl -fsSL https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh | sudo bash
+
+# 或下载后运行
+wget https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh
+sudo bash nfter.sh
 ```
 
 ## 使用方法
@@ -37,13 +42,20 @@ sudo bash install.sh
 
 ```bash
 sudo nfter
+# 或
+sudo bash nfter.sh
 ```
 
 ### 主菜单
 
 ```
 ============================================================
-  nfter - nftables 端口转发管理工具
+             nfter - nftables 端口转发管理工具
+一个交互式的 nftables 端口转发管理工具，适用于 Debian/Ubuntu 系统。
+特点：①采用systemd和配置文件对iptables的替代品nftables进行管理
+     ②实现不加密单个端口转发和连续多个端口转发，支持IPv4、IPv6及域名
+     ③系统级内核转发效率更高
+说明文档：https://github.com/Yorkian/Nfter
 ============================================================
 
   1. 添加单端口转发
@@ -64,10 +76,10 @@ sudo nfter
 
 ```
 ┌──────┬──────┬───────────────┬───────────────────┬───────────────┬──────────────────┬────────┐
-│ 编号  │ 协议  │   本地端口     │     目标地址       │   目标端口     │       流量        │ IP版本  │
+│ 编号  │ 协议 │   本地端口     │     目标地址       │   目标端口     │        流量        │  IP版本 │
 ├──────┼──────┼───────────────┼───────────────────┼───────────────┼──────────────────┼────────┤
-│  1   │ TCP  │ 40000-49999   │ 169.203.124.60    │ 40000-49999   │ 21.4K包/1.3 MB   │  IPv4  │
-│  2   │ UDP  │ 40000-49999   │ 169.203.124.60    │ 40000-49999   │ 1.2K包/188.6 KB  │  IPv4  │
+│  1   │ TCP  │ 40000-49999   │ 10.0.1.1          │ 40000-49999   │ 21.4K包/1.3 MB   │  IPv4  │
+│  2   │ UDP  │ 40000-49999   │ 110.0.2.2         │ 40000-49999   │ 1.2K包/188.6 KB  │  IPv4  │
 │  3   │ TCP  │    61888      │ example.com       │    15888      │ 7.1K包/440.9 KB  │  IPv4  │
 │  4   │ UDP  │    61888      │ example.com       │    15888      │ 4.8K包/726.5 KB  │  IPv4  │
 └──────┴──────┴───────────────┴───────────────────┴───────────────┴──────────────────┴────────┘
@@ -164,6 +176,32 @@ sudo systemctl status nfter   # 查看状态
 - **包数量**: 自动转换为 K/M 单位
 - **字节数**: 自动转换为 KB/MB/GB 单位
 
+## 卸载程序
+
+如需完全卸载 nfter，请执行以下命令：
+
+```bash
+# 1. 停止并禁用服务
+sudo systemctl stop nfter
+sudo systemctl disable nfter
+
+# 2. 删除程序文件
+sudo rm -f /usr/local/bin/nfter
+sudo rm -f /etc/systemd/system/nfter.service
+
+# 3. 删除配置和日志（可选）
+sudo rm -rf /etc/nfter
+sudo rm -f /var/log/nfter.log
+sudo rm -f /var/run/nfter-daemon.pid
+
+# 4. 重载 systemd
+sudo systemctl daemon-reload
+
+# 5. 清空转发规则（可选，谨慎操作）
+sudo nft flush table ip nat
+sudo nft flush table ip6 nat
+```
+
 ## 常用 nft 命令
 
 ```bash
@@ -175,12 +213,6 @@ sudo nft list table ip nat
 
 # 从文件加载规则
 sudo nft -f /etc/nftables.conf
-```
-
-## 卸载
-
-```bash
-sudo nfter.sh -uninstall
 ```
 
 ## 注意事项
