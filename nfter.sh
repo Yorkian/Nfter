@@ -12,8 +12,8 @@ NC='\033[0m'
 
 SERVICE_FILE="/etc/systemd/system/nfter.service"
 BIN_FILE="/usr/local/bin/nfter"
-#GITHUB_BASE="https://raw.githubusercontent.com/Yorkian/Nfter/main" 
-GITHUB_BASE="https://ghproxy.cfd/raw.githubusercontent.com/Yorkian/Nfter/main" #默认开启中国加速
+GITHUB_BASE="https://raw.githubusercontent.com/Yorkian/Nfter/main" 
+#GITHUB_BASE="https://ghproxy.cfd/raw.githubusercontent.com/Yorkian/Nfter/main" #开启中国加速
 
 
 # 检查是否通过管道运行
