@@ -48,11 +48,13 @@ install_nfter() {
     # 检查系统
     if [ ! -f /etc/debian_version ]; then
         echo -e "${YELLOW}警告: 此脚本针对Debian/Ubuntu系统设计${NC}"
-        if ! is_pipe_mode; then
+        if is_pipe_mode; then
+            read -p "是否继续安装? [y/N]: " confirm </dev/tty
+        else
             read -p "是否继续安装? [y/N]: " confirm
-            if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-                exit 1
-            fi
+        fi
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            exit 1
         fi
     fi
 
@@ -153,16 +155,16 @@ install_nfter() {
     echo -e "  ${YELLOW}sudo systemctl enable --now nfter${NC}  # 启动并开机自启"
     echo
     
-    # 如果是管道模式，不询问进入主菜单
+    # 自动进入主菜单
     if is_pipe_mode; then
-        echo -e "${YELLOW}提示: 请运行 'sudo nfter' 进入主菜单${NC}"
-        exit 0
-    fi
-    
-    # 交互模式下询问是否进入主菜单
-    read -p "是否立即进入主菜单? [Y/n]: " enter_menu
-    if [ "$enter_menu" != "n" ] && [ "$enter_menu" != "N" ]; then
-        exec "$BIN_FILE"
+        # 管道模式下重定向输入到终端
+        exec "$BIN_FILE" </dev/tty
+    else
+        # 交互模式
+        read -p "是否立即进入主菜单? [Y/n]: " enter_menu
+        if [ "$enter_menu" != "n" ] && [ "$enter_menu" != "N" ]; then
+            exec "$BIN_FILE"
+        fi
     fi
 }
 
@@ -171,14 +173,11 @@ main() {
     check_root
     
     if check_installed; then
-        # 已安装
+        # 已安装，直接运行nfter
         if is_pipe_mode; then
-            # 管道模式下提示用户手动运行
-            echo -e "${GREEN}nfter 已安装${NC}"
-            echo -e "${YELLOW}请运行 'sudo nfter' 进入主菜单${NC}"
-            exit 0
+            # 管道模式下重定向输入到终端
+            exec "$BIN_FILE" </dev/tty
         else
-            # 交互模式下直接运行
             exec "$BIN_FILE"
         fi
     else
