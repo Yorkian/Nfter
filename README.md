@@ -31,6 +31,9 @@
 # 一键安装并运行
 curl -fsSL https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh | sudo bash
 
+# 一键安装并运行(中国大陆加速）
+curl -fsSL https://ghproxy.cfd/raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh | sudo bash
+
 # 或下载后运行
 wget https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh
 sudo bash nfter.sh
