@@ -2,6 +2,7 @@
 """
 nfter - nftables 端口转发管理工具
 支持单端口、多端口转发，支持IPv4和IPv6目标，支持域名动态解析
+支持端口访问限制（IP白名单）
 适用于 Debian 系统
 """
 
@@ -18,6 +19,7 @@ from datetime import datetime
 
 # 配置文件路径
 CONFIG_FILE = "/etc/nfter/domains.json"
+ACL_CONFIG_FILE = "/etc/nfter/acl.json"
 PID_FILE = "/var/run/nfter-daemon.pid"
 LOG_FILE = "/var/log/nfter.log"
 
@@ -194,11 +196,41 @@ def init_nat_table():
     # 确保配置目录存在
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
 
+def init_filter_table():
+    """初始化filter表和链用于访问控制"""
+    success, stdout, _ = run_cmd("nft list tables")
+    
+    # 创建 ip filter 表
+    if "table ip filter" not in stdout:
+        run_cmd("nft add table ip filter")
+    
+    # 创建 ip6 filter 表
+    if "table ip6 filter" not in stdout:
+        run_cmd("nft add table ip6 filter")
+    
+    # 检查并创建 input 链 (IPv4) - 默认接受
+    success, stdout, _ = run_cmd("nft list chain ip filter input 2>/dev/null")
+    if not success:
+        run_cmd("nft add chain ip filter input { type filter hook input priority 0 \\; policy accept \\; }")
+    
+    # 检查并创建 input 链 (IPv6) - 默认接受
+    success, stdout, _ = run_cmd("nft list chain ip6 filter input 2>/dev/null")
+    if not success:
+        run_cmd("nft add chain ip6 filter input { type filter hook input priority 0 \\; policy accept \\; }")
+
 def validate_ip(ip_str):
     """验证IP地址，返回 (是否有效, IP版本)"""
     try:
         ip = ipaddress.ip_address(ip_str)
         return True, ip.version
+    except ValueError:
+        return False, None
+
+def validate_cidr(cidr_str):
+    """验证CIDR格式的IP段，返回 (是否有效, IP版本)"""
+    try:
+        network = ipaddress.ip_network(cidr_str, strict=False)
+        return True, network.version
     except ValueError:
         return False, None
 
@@ -209,6 +241,21 @@ def validate_port(port_str):
         return 1 <= port <= 65535
     except ValueError:
         return False
+
+def validate_port_range(port_range_str):
+    """验证端口范围，如 '10000' 或 '10000-10100'"""
+    if '-' in port_range_str:
+        parts = port_range_str.split('-')
+        if len(parts) != 2:
+            return False
+        try:
+            start = int(parts[0])
+            end = int(parts[1])
+            return 1 <= start <= 65535 and 1 <= end <= 65535 and start <= end
+        except ValueError:
+            return False
+    else:
+        return validate_port(port_range_str)
 
 def resolve_domain(domain):
     """解析域名为IP地址，返回 (IP, 版本) 或 (None, None)"""
@@ -396,6 +443,51 @@ def log_message(message):
             f.write(f"[{timestamp}] {message}\n")
     except:
         pass
+
+# ==================== ACL访问控制配置管理 ====================
+
+def load_acl_config():
+    """加载ACL配置"""
+    if os.path.exists(ACL_CONFIG_FILE):
+        try:
+            with open(ACL_CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {"rules": []}
+    return {"rules": []}
+
+def save_acl_config(config):
+    """保存ACL配置"""
+    os.makedirs(os.path.dirname(ACL_CONFIG_FILE), exist_ok=True)
+    with open(ACL_CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+
+def add_acl_rule_config(port_range, allowed_ip, protocols, ip_version, allow_handle, drop_handle):
+    """添加ACL规则记录"""
+    config = load_acl_config()
+    
+    rule = {
+        "port_range": port_range,
+        "allowed_ip": allowed_ip,
+        "protocols": protocols,
+        "ip_version": ip_version,
+        "allow_handle": allow_handle,
+        "drop_handle": drop_handle,
+        "created_at": datetime.now().isoformat()
+    }
+    
+    config["rules"].append(rule)
+    save_acl_config(config)
+
+def remove_acl_rule_config(allow_handle):
+    """根据allow_handle删除ACL规则记录"""
+    config = load_acl_config()
+    new_rules = []
+    for r in config["rules"]:
+        if r.get("allow_handle") != allow_handle:
+            new_rules.append(r)
+    config["rules"] = new_rules
+    save_acl_config(config)
 
 # ==================== 守护进程管理 ====================
 
@@ -587,6 +679,93 @@ def parse_single_rule(line, ip_version, rule_id, handle_to_domain=None):
         return rule
     return None
 
+def parse_acl_rules():
+    """解析所有ACL访问控制规则"""
+    rules = []
+    rule_id = 1
+    
+    # 加载ACL配置
+    acl_config = load_acl_config()
+    handle_to_config = {}
+    for r in acl_config.get("rules", []):
+        if r.get("allow_handle"):
+            handle_to_config[r["allow_handle"]] = r
+    
+    # 解析 IPv4 filter规则
+    success, stdout, _ = run_cmd("nft -a list chain ip filter input 2>/dev/null")
+    if success:
+        for line in stdout.split('\n'):
+            # 只解析包含 saddr 和 dport 且是 accept 的规则（白名单规则）
+            if 'saddr' in line and 'dport' in line and 'accept' in line:
+                rule = parse_single_acl_rule(line, 'IPv4', rule_id, handle_to_config)
+                if rule:
+                    rules.append(rule)
+                    rule_id += 1
+    
+    # 解析 IPv6 filter规则
+    success, stdout, _ = run_cmd("nft -a list chain ip6 filter input 2>/dev/null")
+    if success:
+        for line in stdout.split('\n'):
+            if 'saddr' in line and 'dport' in line and 'accept' in line:
+                rule = parse_single_acl_rule(line, 'IPv6', rule_id, handle_to_config)
+                if rule:
+                    rules.append(rule)
+                    rule_id += 1
+    
+    return rules
+
+def parse_single_acl_rule(line, ip_version, rule_id, handle_to_config=None):
+    """解析单条ACL规则"""
+    rule = {
+        'id': rule_id,
+        'ip_version': ip_version,
+        'protocol': '',
+        'port_range': '',
+        'allowed_ip': '',
+        'handle': '',
+        'drop_handle': '',
+        'packets': 0,
+        'bytes': 0,
+        'raw': line.strip()
+    }
+    
+    # 提取协议
+    line_lower = line.lower()
+    if 'tcp dport' in line_lower:
+        rule['protocol'] = 'TCP'
+    elif 'udp dport' in line_lower:
+        rule['protocol'] = 'UDP'
+    else:
+        rule['protocol'] = 'ALL'
+    
+    # 提取端口范围
+    dport_match = re.search(r'dport\s+(\d+(?:-\d+)?)', line)
+    if dport_match:
+        rule['port_range'] = dport_match.group(1)
+    
+    # 提取允许的IP/CIDR
+    saddr_match = re.search(r'saddr\s+([\d./]+|[0-9a-fA-F:./]+)', line)
+    if saddr_match:
+        rule['allowed_ip'] = saddr_match.group(1)
+    
+    # 提取流量统计
+    counter_match = re.search(r'packets\s+(\d+)\s+bytes\s+(\d+)', line)
+    if counter_match:
+        rule['packets'] = int(counter_match.group(1))
+        rule['bytes'] = int(counter_match.group(2))
+    
+    # 提取 handle
+    handle_match = re.search(r'handle\s+(\d+)', line)
+    if handle_match:
+        rule['handle'] = handle_match.group(1)
+        # 查找对应的drop handle
+        if handle_to_config and rule['handle'] in handle_to_config:
+            rule['drop_handle'] = handle_to_config[rule['handle']].get('drop_handle', '')
+    
+    if rule['port_range'] and rule['allowed_ip']:
+        return rule
+    return None
+
 def print_rules_table(rules):
     """以表格形式打印规则"""
     if not rules:
@@ -684,6 +863,61 @@ def print_rules_table(rules):
     total_packets = sum(r['packets'] for r in rules)
     total_bytes = sum(r['bytes'] for r in rules)
     print_info(f"共 {len(rules)} 条转发规则 | 总流量: {format_packets(total_packets)} 包 / {format_bytes(total_bytes)}")
+
+def print_acl_rules_table(rules):
+    """以表格形式打印ACL规则"""
+    if not rules:
+        print_info("当前没有端口访问限制规则")
+        return
+    
+    # 表格标题
+    headers = ['编号', '协议', '端口范围', '允许IP段', '流量', 'IP版本']
+    
+    # 准备数据
+    for rule in rules:
+        traffic = f"{format_packets(rule['packets'])}包/{format_bytes(rule['bytes'])}"
+        rule['traffic_display'] = traffic
+    
+    # 计算每列所需的显示宽度
+    col_widths = []
+    
+    col_widths.append(max(get_display_width(headers[0]), max(get_display_width(str(r['id'])) for r in rules)) + 2)
+    col_widths.append(max(get_display_width(headers[1]), max(get_display_width(r['protocol']) for r in rules)) + 2)
+    col_widths.append(max(get_display_width(headers[2]), max(get_display_width(r['port_range']) for r in rules)) + 2)
+    col_widths.append(max(get_display_width(headers[3]), max(get_display_width(r['allowed_ip']) for r in rules)) + 2)
+    col_widths.append(max(get_display_width(headers[4]), max(get_display_width(r['traffic_display']) for r in rules)) + 2)
+    col_widths.append(max(get_display_width(headers[5]), max(get_display_width(r['ip_version']) for r in rules)) + 2)
+    
+    # 顶部边框
+    print_color("┌" + "┬".join("─" * w for w in col_widths) + "┐", Colors.CYAN)
+    
+    # 标题行
+    header_row = "│"
+    for i, h in enumerate(headers):
+        header_row += pad_to_width(h, col_widths[i]) + "│"
+    print_color(header_row, Colors.CYAN + Colors.BOLD)
+    
+    # 标题分隔线
+    print_color("├" + "┼".join("─" * w for w in col_widths) + "┤", Colors.CYAN)
+    
+    # 数据行
+    for rule in rules:
+        row = "│"
+        row += pad_to_width(str(rule['id']), col_widths[0]) + "│"
+        row += pad_to_width(rule['protocol'], col_widths[1]) + "│"
+        row += pad_to_width(rule['port_range'], col_widths[2]) + "│"
+        row += pad_to_width(rule['allowed_ip'], col_widths[3]) + "│"
+        row += pad_to_width(rule['traffic_display'], col_widths[4]) + "│"
+        row += pad_to_width(rule['ip_version'], col_widths[5]) + "│"
+        print(row)
+    
+    # 底部边框
+    print_color("└" + "┴".join("─" * w for w in col_widths) + "┘", Colors.CYAN)
+    
+    print()
+    total_packets = sum(r['packets'] for r in rules)
+    total_bytes = sum(r['bytes'] for r in rules)
+    print_info(f"共 {len(rules)} 条访问限制规则 | 总流量: {format_packets(total_packets)} 包 / {format_bytes(total_bytes)}")
 
 def show_rules():
     """显示当前的端口转发规则"""
@@ -1092,6 +1326,267 @@ def save_rules_prompt():
     if save != 'n':
         save_rules()
 
+# ==================== 端口访问限制功能 ====================
+
+def manage_port_acl():
+    """管理端口访问限制"""
+    print_header("端口访问限制（IP白名单）")
+    
+    print("操作选项:")
+    print("  1. 添加访问限制")
+    print("  2. 查看访问限制规则")
+    print("  3. 删除访问限制")
+    print("  4. 清空所有访问限制")
+    print("  0. 返回")
+    print()
+    
+    choice = get_input("请选择", lambda x: x in ['0', '1', '2', '3', '4'], "请输入 0-4")
+    if choice is None or choice == '0':
+        return
+    
+    if choice == '1':
+        add_port_acl()
+    elif choice == '2':
+        show_port_acl()
+    elif choice == '3':
+        delete_port_acl()
+    elif choice == '4':
+        flush_port_acl()
+
+def add_port_acl():
+    """添加端口访问限制"""
+    print_header("添加端口访问限制")
+    print_info("输入 'q' 可随时返回")
+    print_info("此功能限制只有指定IP段可以访问指定端口\n")
+    
+    # 初始化filter表
+    init_filter_table()
+    
+    # 选择协议
+    print("选择协议:")
+    print("  1. TCP")
+    print("  2. UDP")
+    print("  3. TCP + UDP")
+    protocol_choice = get_input(
+        "请选择 [1-3]",
+        lambda x: x in ['1', '2', '3'],
+        "请输入 1、2 或 3",
+        default='3'
+    )
+    if protocol_choice is None:
+        return
+    
+    protocols = []
+    if protocol_choice == '1':
+        protocols = ['tcp']
+    elif protocol_choice == '2':
+        protocols = ['udp']
+    else:
+        protocols = ['tcp', 'udp']
+    
+    # 输入端口范围
+    print()
+    print_info("端口范围格式: 单端口如 '10000' 或范围如 '10000-10100'")
+    port_range = get_input(
+        "限制端口范围",
+        validate_port_range,
+        "请输入有效的端口或端口范围 (如: 10000 或 10000-10100)"
+    )
+    if port_range is None:
+        return
+    
+    # 格式化端口范围（单端口转为范围格式）
+    if '-' not in port_range:
+        port_range_display = port_range
+        port_range_nft = port_range
+    else:
+        port_range_display = port_range
+        port_range_nft = port_range
+    
+    # 输入允许的IP段
+    print()
+    print_info("IP段格式: 单个IP如 '192.168.1.100' 或CIDR如 '192.168.1.0/24'")
+    allowed_ip = get_input(
+        "允许访问的IP段",
+        lambda x: validate_ip(x)[0] or validate_cidr(x)[0],
+        "请输入有效的IP地址或CIDR格式的IP段",
+        default='127.0.0.1'
+    )
+    if allowed_ip is None:
+        return
+    
+    # 判断IP版本
+    valid_ip, ip_version = validate_ip(allowed_ip)
+    if not valid_ip:
+        valid_cidr, ip_version = validate_cidr(allowed_ip)
+    
+    if ip_version is None:
+        print_error("无法确定IP版本")
+        return
+    
+    # 确认信息
+    print()
+    print_color("即将添加以下访问限制:", Colors.YELLOW)
+    print(f"  协议: {', '.join(protocols).upper()}")
+    print(f"  限制端口: {port_range_display}")
+    print(f"  允许IP段: {allowed_ip}")
+    print(f"  IP版本: IPv{ip_version}")
+    print()
+    print_warning("注意: 添加后，只有指定IP段可以访问该端口，其他IP将被拒绝！")
+    print()
+    
+    confirm = input(f"{Colors.CYAN}确认添加？[Y/n]: {Colors.ENDC}").strip().lower()
+    if confirm == 'n':
+        print_warning("已取消操作")
+        return
+    
+    # 执行添加
+    table = "ip" if ip_version == 4 else "ip6"
+    saddr_key = "ip saddr" if ip_version == 4 else "ip6 saddr"
+    success_count = 0
+    
+    for proto in protocols:
+        # 1. 添加允许规则（白名单IP）
+        allow_cmd = f"nft add rule {table} filter input {proto} dport {port_range_nft} {saddr_key} {allowed_ip} counter accept"
+        success1, _, stderr1 = run_cmd(allow_cmd)
+        
+        if not success1:
+            print_error(f"添加 {proto.upper()} 允许规则失败: {stderr1}")
+            continue
+        
+        # 获取allow规则的handle
+        success_h1, stdout_h1, _ = run_cmd(f"nft -a list chain {table} filter input | grep '{proto} dport {port_range_nft}' | grep 'accept' | grep -oP 'handle \\d+' | tail -1")
+        allow_handle = ""
+        if success_h1:
+            handle_match = re.search(r'handle (\d+)', stdout_h1)
+            if handle_match:
+                allow_handle = handle_match.group(1)
+        
+        # 2. 添加拒绝规则（其他IP）
+        drop_cmd = f"nft add rule {table} filter input {proto} dport {port_range_nft} counter drop"
+        success2, _, stderr2 = run_cmd(drop_cmd)
+        
+        if not success2:
+            print_error(f"添加 {proto.upper()} 拒绝规则失败: {stderr2}")
+            # 回滚允许规则
+            if allow_handle:
+                run_cmd(f"nft delete rule {table} filter input handle {allow_handle}")
+            continue
+        
+        # 获取drop规则的handle
+        success_h2, stdout_h2, _ = run_cmd(f"nft -a list chain {table} filter input | grep '{proto} dport {port_range_nft}' | grep 'drop' | grep -oP 'handle \\d+' | tail -1")
+        drop_handle = ""
+        if success_h2:
+            handle_match = re.search(r'handle (\d+)', stdout_h2)
+            if handle_match:
+                drop_handle = handle_match.group(1)
+        
+        # 保存到配置
+        add_acl_rule_config(port_range_display, allowed_ip, [proto], ip_version, allow_handle, drop_handle)
+        success_count += 1
+    
+    if success_count > 0:
+        print_success(f"成功添加 {success_count} 条访问限制规则")
+        save_rules_prompt()
+    else:
+        print_error("添加访问限制失败")
+
+def show_port_acl():
+    """查看端口访问限制规则"""
+    print_header("当前端口访问限制规则")
+    
+    rules = parse_acl_rules()
+    print_acl_rules_table(rules)
+
+def delete_port_acl():
+    """删除端口访问限制"""
+    print_header("删除端口访问限制")
+    
+    rules = parse_acl_rules()
+    
+    if not rules:
+        print_info("当前没有可删除的访问限制规则")
+        return
+    
+    print_acl_rules_table(rules)
+    
+    print_info("输入 'q' 返回\n")
+    
+    rule_id = get_input(
+        "请输入要删除的规则编号",
+        lambda x: x.isdigit() and 1 <= int(x) <= len(rules),
+        f"请输入 1-{len(rules)} 之间的数字"
+    )
+    if rule_id is None:
+        return
+    
+    rule = rules[int(rule_id) - 1]
+    
+    print()
+    print_color("即将删除以下访问限制:", Colors.YELLOW)
+    print(f"  协议: {rule['protocol']}")
+    print(f"  端口范围: {rule['port_range']}")
+    print(f"  允许IP段: {rule['allowed_ip']}")
+    print(f"  IP版本: {rule['ip_version']}")
+    print()
+    print_warning("删除后，该端口将对所有IP开放访问！")
+    print()
+    
+    confirm = input(f"{Colors.CYAN}确认删除？[y/N]: {Colors.ENDC}").strip().lower()
+    if confirm != 'y':
+        print_warning("已取消操作")
+        return
+    
+    table = "ip" if rule['ip_version'] == 'IPv4' else "ip6"
+    
+    # 删除允许规则
+    if rule['handle']:
+        cmd1 = f"nft delete rule {table} filter input handle {rule['handle']}"
+        run_cmd(cmd1)
+    
+    # 删除拒绝规则
+    if rule['drop_handle']:
+        cmd2 = f"nft delete rule {table} filter input handle {rule['drop_handle']}"
+        run_cmd(cmd2)
+    
+    # 从配置中删除
+    if rule['handle']:
+        remove_acl_rule_config(rule['handle'])
+    
+    print_success("访问限制规则删除成功")
+    save_rules_prompt()
+
+def flush_port_acl():
+    """清空所有端口访问限制"""
+    print_header("清空所有端口访问限制")
+    
+    rules = parse_acl_rules()
+    if not rules:
+        print_info("当前没有访问限制规则")
+        return
+    
+    print_acl_rules_table(rules)
+    
+    print_warning("此操作将删除所有端口访问限制规则！")
+    print_warning("删除后，所有端口将对所有IP开放！")
+    
+    confirm = input(f"{Colors.RED}确认清空所有访问限制？请输入 'yes' 确认: {Colors.ENDC}").strip().lower()
+    if confirm != 'yes':
+        print_warning("已取消操作")
+        return
+    
+    # 清空filter表的input链规则
+    run_cmd("nft flush chain ip filter input 2>/dev/null")
+    run_cmd("nft flush chain ip6 filter input 2>/dev/null")
+    
+    # 清空ACL配置
+    save_acl_config({"rules": []})
+    
+    print_success("所有访问限制规则已清空")
+    save_rules_prompt()
+
+# ==================== 其他功能 ====================
+
 def manage_daemon():
     """管理守护进程"""
     print_header("域名监控服务管理")
@@ -1189,11 +1684,17 @@ def show_status():
     total_bytes = sum(r['bytes'] for r in rules)
     
     print()
-    print_color("【规则统计】", Colors.YELLOW + Colors.BOLD)
+    print_color("【转发规则统计】", Colors.YELLOW + Colors.BOLD)
     print(f"  IPv4 转发规则数: {ipv4_count}")
     print(f"  IPv6 转发规则数: {ipv6_count}")
     print(f"  总计: {len(rules)}")
     print(f"  总流量: {format_packets(total_packets)} 包 / {format_bytes(total_bytes)}")
+    
+    # ACL规则统计
+    acl_rules = parse_acl_rules()
+    print()
+    print_color("【访问限制规则统计】", Colors.YELLOW + Colors.BOLD)
+    print(f"  访问限制规则数: {len(acl_rules)}")
     
     # 域名映射统计
     config = load_domain_config()
@@ -1223,6 +1724,12 @@ def show_help():
   5. 清空规则：删除所有NAT规则（谨慎使用）
   6. 域名服务：管理域名动态解析服务
 
+【端口访问限制（IP白名单）】
+  - 限制指定端口只允许特定IP段访问
+  - 支持单个IP或CIDR格式的IP段
+  - 支持单端口或端口范围
+  - 默认允许IP为127.0.0.1（仅本机访问）
+
 【域名支持】
   - 目标地址可以输入域名，系统会自动解析为IP
   - 启动守护进程后，每10分钟自动检查域名IP变化
@@ -1232,12 +1739,14 @@ def show_help():
   - 协议默认选择: TCP + UDP（直接回车即可）
   - 目标端口默认: 与本地端口相同
   - 端口映射默认: 保持原端口
+  - IP白名单默认: 127.0.0.1
 
 【注意事项】
   - 需要root权限运行
   - 修改后建议保存规则，否则重启后失效
   - IPv6转发需要目标支持IPv6
   - 确保防火墙允许相关端口的流量
+  - 添加访问限制后，未在白名单的IP将无法访问该端口
 """)
 
 def main_menu():
@@ -1250,6 +1759,7 @@ def main_menu():
         print_color("特点：① 采用systemd和配置文件对iptables的替代品nftables进行管理", Colors.CYAN)
         print_color("      ② 实现不加密单个端口转发和连续多个端口转发，支持IPv4、IPv6及域名", Colors.CYAN)
         print_color("      ③ 系统级内核转发效率更高", Colors.CYAN)
+        print_color("      ④ 支持端口访问限制（IP白名单）", Colors.CYAN)
         print_color("说明文档：https://github.com/Yorkian/Nfter", Colors.CYAN)
         print_color("=" * 60, Colors.CYAN)
         print()
@@ -1260,12 +1770,13 @@ def main_menu():
         print("  5. 清空所有规则")
         print("  6. 保存规则")
         print("  7. 域名监控服务")
-        print("  8. 系统状态")
-        print("  9. 帮助")
+        print("  8. 端口访问限制")
+        print("  9. 系统状态")
+        print("  h. 帮助")
         print("  0. 退出")
         print()
         
-        choice = input(f"{Colors.CYAN}请选择操作 [0-9]: {Colors.ENDC}").strip()
+        choice = input(f"{Colors.CYAN}请选择操作 [0-9/h]: {Colors.ENDC}").strip().lower()
         
         if choice == '1':
             add_single_port_forward()
@@ -1282,8 +1793,10 @@ def main_menu():
         elif choice == '7':
             manage_daemon()
         elif choice == '8':
-            show_status()
+            manage_port_acl()
         elif choice == '9':
+            show_status()
+        elif choice == 'h':
             show_help()
         elif choice == '0':
             print_info("感谢使用，再见！")
