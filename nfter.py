@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-nfter - nftables 端口转发管理工具
-支持单端口、多端口转发，支持IPv4和IPv6目标，支持域名动态解析
-支持端口访问限制（IP白名单）
-适用于 Debian 系统
+nfter - nftables 端口转发管理工具 (链式转发修复版)
+修复了链式转发失效问题：masquerade 规则现在匹配目标 IP
 """
 
 import subprocess
@@ -36,11 +34,9 @@ class Colors:
     DIM = '\033[2m'
 
 def print_color(text, color):
-    """打印彩色文本"""
     print(f"{color}{text}{Colors.ENDC}")
 
 def print_header(text):
-    """打印标题"""
     print()
     print_color("=" * 60, Colors.CYAN)
     print_color(f"  {text}", Colors.CYAN + Colors.BOLD)
@@ -60,7 +56,6 @@ def print_info(text):
     print_color(f"ℹ {text}", Colors.BLUE)
 
 def get_display_width(text):
-    """计算字符串的显示宽度（中文字符占2个宽度）"""
     width = 0
     for char in str(text):
         if '\u4e00' <= char <= '\u9fff' or \
@@ -72,1685 +67,687 @@ def get_display_width(text):
     return width
 
 def pad_to_width(text, target_width, align='center'):
-    """将字符串填充到指定显示宽度"""
     text = str(text)
     current_width = get_display_width(text)
     padding_needed = target_width - current_width
-    
-    if padding_needed <= 0:
-        return text
-    
+    if padding_needed <= 0: return text
     if align == 'center':
         left_pad = padding_needed // 2
         right_pad = padding_needed - left_pad
         return ' ' * left_pad + text + ' ' * right_pad
-    elif align == 'left':
-        return text + ' ' * padding_needed
-    else:  # right
-        return ' ' * padding_needed + text
+    elif align == 'left': return text + ' ' * padding_needed
+    else: return ' ' * padding_needed + text
 
 def format_bytes(bytes_count):
-    """格式化字节数为人类可读格式"""
-    try:
-        bytes_count = int(bytes_count)
-    except (ValueError, TypeError):
-        return "0 B"
-    
-    if bytes_count < 1024:
-        return f"{bytes_count} B"
-    elif bytes_count < 1024 * 1024:
-        return f"{bytes_count / 1024:.1f} KB"
-    elif bytes_count < 1024 * 1024 * 1024:
-        return f"{bytes_count / (1024 * 1024):.1f} MB"
-    else:
-        return f"{bytes_count / (1024 * 1024 * 1024):.2f} GB"
+    try: bytes_count = int(bytes_count)
+    except: return "0 B"
+    if bytes_count < 1024: return f"{bytes_count} B"
+    elif bytes_count < 1024 * 1024: return f"{bytes_count / 1024:.1f} KB"
+    elif bytes_count < 1024 * 1024 * 1024: return f"{bytes_count / (1024 * 1024):.1f} MB"
+    else: return f"{bytes_count / (1024 * 1024 * 1024):.2f} GB"
 
 def format_packets(packets_count):
-    """格式化包数量"""
-    try:
-        packets_count = int(packets_count)
-    except (ValueError, TypeError):
-        return "0"
-    
-    if packets_count < 1000:
-        return str(packets_count)
-    elif packets_count < 1000000:
-        return f"{packets_count / 1000:.1f}K"
-    else:
-        return f"{packets_count / 1000000:.1f}M"
+    try: packets_count = int(packets_count)
+    except: return "0"
+    if packets_count < 1000: return str(packets_count)
+    elif packets_count < 1000000: return f"{packets_count / 1000:.1f}K"
+    else: return f"{packets_count / 1000000:.1f}M"
 
 def run_cmd(cmd, capture=True):
-    """运行命令并返回结果"""
     try:
-        result = subprocess.run(
-            cmd, 
-            shell=True, 
-            capture_output=capture, 
-            text=True,
-            timeout=30
-        )
+        result = subprocess.run(cmd, shell=True, capture_output=capture, text=True, timeout=30)
         return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "", "命令执行超时"
-    except Exception as e:
-        return False, "", str(e)
+    except: return False, "", "Timeout"
 
 def check_root():
-    """检查是否以root权限运行"""
-    if os.geteuid() != 0:
-        print_error("此工具需要root权限运行！")
-        print_info("请使用 sudo nfter 运行")
+    if os.getuid() != 0:
+        print_error("需要root权限运行！")
         sys.exit(1)
 
 def check_nftables():
-    """检查nftables是否已安装"""
     success, _, _ = run_cmd("which nft")
     if not success:
         print_error("nftables 未安装！")
-        print_info("请运行: apt install nftables")
         sys.exit(1)
-    
-    # 检查nftables服务状态
-    success, _, _ = run_cmd("systemctl is-active nftables")
-    if not success:
-        print_warning("nftables服务未运行，正在启动...")
-        run_cmd("systemctl start nftables")
-        run_cmd("systemctl enable nftables")
+    run_cmd("systemctl start nftables")
+    run_cmd("systemctl enable nftables")
 
 def init_nat_table():
-    """初始化NAT表和链（如果不存在）"""
-    success, stdout, _ = run_cmd("nft list tables")
-    
-    # 创建 ip nat 表 (用于IPv4)
-    if "table ip nat" not in stdout:
-        run_cmd("nft add table ip nat")
-    
-    # 创建 ip6 nat 表 (用于IPv6)
-    if "table ip6 nat" not in stdout:
-        run_cmd("nft add table ip6 nat")
-    
-    # 检查并创建 prerouting 链 (IPv4)
-    success, stdout, _ = run_cmd("nft list chain ip nat prerouting 2>/dev/null")
-    if not success:
-        run_cmd("nft add chain ip nat prerouting { type nat hook prerouting priority -100 \\; }")
-    
-    # 检查并创建 postrouting 链 (IPv4)
-    success, stdout, _ = run_cmd("nft list chain ip nat postrouting 2>/dev/null")
-    if not success:
-        run_cmd("nft add chain ip nat postrouting { type nat hook postrouting priority 100 \\; }")
-    
-    # 检查并创建 prerouting 链 (IPv6)
-    success, stdout, _ = run_cmd("nft list chain ip6 nat prerouting 2>/dev/null")
-    if not success:
-        run_cmd("nft add chain ip6 nat prerouting { type nat hook prerouting priority -100 \\; }")
-    
-    # 检查并创建 postrouting 链 (IPv6)
-    success, stdout, _ = run_cmd("nft list chain ip6 nat postrouting 2>/dev/null")
-    if not success:
-        run_cmd("nft add chain ip6 nat postrouting { type nat hook postrouting priority 100 \\; }")
-    
-    # 启用IP转发
+    run_cmd("nft add table ip nat")
+    run_cmd("nft add table ip6 nat")
+    run_cmd("nft add chain ip nat prerouting { type nat hook prerouting priority -100 ; }")
+    run_cmd("nft add chain ip nat postrouting { type nat hook postrouting priority 100 ; }")
+    run_cmd("nft add chain ip6 nat prerouting { type nat hook prerouting priority -100 ; }")
+    run_cmd("nft add chain ip6 nat postrouting { type nat hook postrouting priority 100 ; }")
     run_cmd("echo 1 > /proc/sys/net/ipv4/ip_forward")
     run_cmd("echo 1 > /proc/sys/net/ipv6/conf/all/forwarding")
-    
-    # 确保配置目录存在
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
 
 def init_filter_table():
-    """初始化filter表和链用于访问控制"""
-    success, stdout, _ = run_cmd("nft list tables")
-    
-    # 创建 ip filter 表
-    if "table ip filter" not in stdout:
-        run_cmd("nft add table ip filter")
-    
-    # 创建 ip6 filter 表
-    if "table ip6 filter" not in stdout:
-        run_cmd("nft add table ip6 filter")
-    
-    # 检查并创建 input 链 (IPv4) - 默认接受
-    success, stdout, _ = run_cmd("nft list chain ip filter input 2>/dev/null")
-    if not success:
-        run_cmd("nft add chain ip filter input { type filter hook input priority 0 \\; policy accept \\; }")
-    
-    # 检查并创建 input 链 (IPv6) - 默认接受
-    success, stdout, _ = run_cmd("nft list chain ip6 filter input 2>/dev/null")
-    if not success:
-        run_cmd("nft add chain ip6 filter input { type filter hook input priority 0 \\; policy accept \\; }")
+    run_cmd("nft add table ip filter")
+    run_cmd("nft add table ip6 filter")
+    run_cmd("nft add chain ip filter input { type filter hook input priority 0 ; policy accept ; }")
+    run_cmd("nft add chain ip6 filter input { type filter hook input priority 0 ; policy accept ; }")
+    run_cmd("nft add chain ip filter forward { type filter hook forward priority 0 ; policy accept ; }")
+    run_cmd("nft add chain ip6 filter forward { type filter hook forward priority 0 ; policy accept ; }")
 
 def validate_ip(ip_str):
-    """验证IP地址，返回 (是否有效, IP版本)"""
     try:
         ip = ipaddress.ip_address(ip_str)
         return True, ip.version
-    except ValueError:
+    except: return False, None
+
+def validate_ip_or_cidr(ip_str):
+    """验证 IP 地址或 CIDR 格式"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return True, ip.version
+    except:
+        pass
+    try:
+        net = ipaddress.ip_network(ip_str, strict=False)
+        return True, net.version
+    except:
         return False, None
 
-def validate_cidr(cidr_str):
-    """验证CIDR格式的IP段，返回 (是否有效, IP版本)"""
-    try:
-        network = ipaddress.ip_network(cidr_str, strict=False)
-        return True, network.version
-    except ValueError:
-        return False, None
+def validate_target(target_str):
+    valid, version = validate_ip(target_str)
+    if valid: return True, target_str, version, False
+    ip, version = resolve_domain(target_str)
+    if ip: return True, ip, version, True
+    return False, None, None, False
 
 def validate_port(port_str):
-    """验证端口号"""
     try:
         port = int(port_str)
         return 1 <= port <= 65535
-    except ValueError:
-        return False
-
-def validate_port_range(port_range_str):
-    """验证端口范围，如 '10000' 或 '10000-10100'"""
-    if '-' in port_range_str:
-        parts = port_range_str.split('-')
-        if len(parts) != 2:
-            return False
-        try:
-            start = int(parts[0])
-            end = int(parts[1])
-            return 1 <= start <= 65535 and 1 <= end <= 65535 and start <= end
-        except ValueError:
-            return False
-    else:
-        return validate_port(port_range_str)
+    except: return False
 
 def resolve_domain(domain):
-    """解析域名为IP地址，返回 (IP, 版本) 或 (None, None)"""
     try:
-        # 先尝试获取IPv4
         result = socket.getaddrinfo(domain, None, socket.AF_INET)
-        if result:
-            ip = result[0][4][0]
-            return ip, 4
-    except socket.gaierror:
-        pass
-    
+        if result: return result[0][4][0], 4
+    except: pass
     try:
-        # 再尝试获取IPv6
         result = socket.getaddrinfo(domain, None, socket.AF_INET6)
-        if result:
-            ip = result[0][4][0]
-            return ip, 6
-    except socket.gaierror:
-        pass
-    
+        if result: return result[0][4][0], 6
+    except: pass
     return None, None
 
-def validate_target(target_str):
-    """验证目标地址（IP或域名），返回 (是否有效, IP地址, IP版本, 是否域名)"""
-    # 先检查是否是有效IP
-    valid, version = validate_ip(target_str)
-    if valid:
-        return True, target_str, version, False
-    
-    # 尝试解析为域名
-    ip, version = resolve_domain(target_str)
-    if ip:
-        return True, ip, version, True
-    
-    return False, None, None, False
-
-def get_input(prompt, validator=None, error_msg="输入无效，请重试", default=None):
-    """获取用户输入并验证，支持默认值"""
+def get_input(prompt, validator=None, error_msg="输入无效", default=None):
     while True:
-        if default is not None:
-            display_prompt = f"{Colors.CYAN}{prompt} [默认: {default}]: {Colors.ENDC}"
-        else:
-            display_prompt = f"{Colors.CYAN}{prompt}: {Colors.ENDC}"
-        
+        display_prompt = f"{Colors.CYAN}{prompt} [默认: {default}]: {Colors.ENDC}" if default is not None else f"{Colors.CYAN}{prompt}: {Colors.ENDC}"
         value = input(display_prompt).strip()
-        
-        if value.lower() == 'q':
-            return None
-        
-        if value == '' and default is not None:
-            return default
-        
+        if value.lower() == 'q': return None
+        if value == '' and default is not None: return default
         if value == '' and default is None:
             print_error(error_msg)
             continue
-            
-        if validator is None or validator(value):
-            return value
+        if validator is None or validator(value): return value
         print_error(error_msg)
 
-# ==================== 域名配置管理 ====================
+# ==================== 配置管理 (全量追踪修复版) ====================
 
 def load_domain_config():
-    """加载域名配置"""
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {"mappings": []}
+            with open(CONFIG_FILE, 'r') as f: return json.load(f)
+        except: return {"mappings": []}
     return {"mappings": []}
 
 def save_domain_config(config):
-    """保存域名配置"""
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
-
-def add_domain_mapping(domain, current_ip, ip_version, local_port, target_port, protocols, handles):
-    """添加域名映射记录"""
-    config = load_domain_config()
-    
-    mapping = {
-        "domain": domain,
-        "current_ip": current_ip,
-        "ip_version": ip_version,
-        "local_port": local_port,
-        "target_port": target_port,
-        "protocols": protocols,
-        "handles": handles,
-        "created_at": datetime.now().isoformat(),
-        "updated_at": datetime.now().isoformat()
-    }
-    
-    config["mappings"].append(mapping)
-    save_domain_config(config)
-
-def remove_domain_mapping_by_handle(handle):
-    """根据handle删除域名映射"""
-    config = load_domain_config()
-    new_mappings = []
-    for m in config["mappings"]:
-        if handle not in m.get("handles", []):
-            new_mappings.append(m)
-    config["mappings"] = new_mappings
-    save_domain_config(config)
-
-def update_domain_ip():
-    """更新所有域名的IP地址（供守护进程调用）"""
-    config = load_domain_config()
-    updated = False
-    
-    for mapping in config["mappings"]:
-        domain = mapping.get("domain")
-        if not domain:
-            continue
-        
-        new_ip, new_version = resolve_domain(domain)
-        if not new_ip:
-            log_message(f"无法解析域名: {domain}")
-            continue
-        
-        old_ip = mapping.get("current_ip")
-        if new_ip != old_ip:
-            log_message(f"域名 {domain} IP变化: {old_ip} -> {new_ip}")
-            
-            # 更新规则
-            success = update_rule_ip(mapping, new_ip, new_version)
-            if success:
-                mapping["current_ip"] = new_ip
-                mapping["ip_version"] = new_version
-                mapping["updated_at"] = datetime.now().isoformat()
-                updated = True
-                log_message(f"规则更新成功: {domain} -> {new_ip}")
-            else:
-                log_message(f"规则更新失败: {domain}")
-    
-    if updated:
-        save_domain_config(config)
-
-def update_rule_ip(mapping, new_ip, new_version):
-    """更新规则中的IP地址"""
-    local_port = mapping.get("local_port")
-    target_port = mapping.get("target_port")
-    protocols = mapping.get("protocols", [])
-    old_handles = mapping.get("handles", [])
-    
-    table = "ip" if new_version == 4 else "ip6"
-    new_handles = []
-    
-    # 删除旧规则
-    for handle in old_handles:
-        run_cmd(f"nft delete rule ip nat prerouting handle {handle} 2>/dev/null")
-        run_cmd(f"nft delete rule ip6 nat prerouting handle {handle} 2>/dev/null")
-    
-    # 添加新规则
-    for proto in protocols:
-        if new_version == 4:
-            dnat_cmd = f"nft add rule {table} nat prerouting {proto} dport {local_port} counter dnat to {new_ip}:{target_port}"
-        else:
-            dnat_cmd = f"nft add rule {table} nat prerouting {proto} dport {local_port} counter dnat to [{new_ip}]:{target_port}"
-        
-        success, _, _ = run_cmd(dnat_cmd)
-        if success:
-            # 获取新的handle
-            success, stdout, _ = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{proto} dport {local_port}' | grep -oP 'handle \\d+' | tail -1")
-            if success:
-                handle_match = re.search(r'handle (\d+)', stdout)
-                if handle_match:
-                    new_handles.append(handle_match.group(1))
-    
-    mapping["handles"] = new_handles
-    
-    # 保存规则
-    run_cmd("nft list ruleset > /etc/nftables.conf.tmp && mv /etc/nftables.conf.tmp /etc/nftables.conf")
-    
-    return len(new_handles) > 0
-
-def log_message(message):
-    """写入日志"""
-    try:
-        with open(LOG_FILE, 'a') as f:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"[{timestamp}] {message}\n")
-    except:
-        pass
-
-# ==================== ACL访问控制配置管理 ====================
+    with open(CONFIG_FILE, 'w') as f: json.dump(config, f, indent=2)
 
 def load_acl_config():
-    """加载ACL配置"""
     if os.path.exists(ACL_CONFIG_FILE):
         try:
-            with open(ACL_CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return {"rules": []}
+            with open(ACL_CONFIG_FILE, 'r') as f: return json.load(f)
+        except: return {"rules": []}
     return {"rules": []}
 
 def save_acl_config(config):
-    """保存ACL配置"""
     os.makedirs(os.path.dirname(ACL_CONFIG_FILE), exist_ok=True)
-    with open(ACL_CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+    with open(ACL_CONFIG_FILE, 'w') as f: json.dump(config, f, indent=2)
 
-def add_acl_rule_config(port_range, allowed_ip, protocols, ip_version, allow_handle, drop_handle):
-    """添加ACL规则记录"""
-    config = load_acl_config()
-    
-    rule = {
-        "port_range": port_range,
-        "allowed_ip": allowed_ip,
-        "protocols": protocols,
+def add_mapping_record(domain, current_ip, ip_version, local_port, target_port, protocols, dnat_handles, masq_handles):
+    config = load_domain_config()
+    mapping = {
+        "domain": domain, 
+        "current_ip": current_ip,
         "ip_version": ip_version,
-        "allow_handle": allow_handle,
-        "drop_handle": drop_handle,
-        "created_at": datetime.now().isoformat()
+        "local_port": str(local_port),
+        "target_port": str(target_port),
+        "protocols": protocols,
+        "dnat_handles": dnat_handles,
+        "masq_handles": masq_handles,
+        "updated_at": datetime.now().isoformat()
     }
+    config["mappings"].append(mapping)
+    save_domain_config(config)
+
+def remove_mapping_by_handle(handle):
+    config = load_domain_config()
+    new_mappings = []
+    found = False
+    for m in config["mappings"]:
+        if handle in m.get("dnat_handles", []) or str(handle) == str(m.get("handle")):
+            found = True
+            table = "ip" if m.get("ip_version") == 4 else "ip6"
+            for h in m.get("dnat_handles", [m.get("handle")]):
+                if h: run_cmd(f"nft delete rule {table} nat prerouting handle {h} 2>/dev/null")
+            for h in m.get("masq_handles", []):
+                run_cmd(f"nft delete rule {table} nat postrouting handle {h} 2>/dev/null")
+        else:
+            new_mappings.append(m)
+    if found: save_domain_config({"mappings": new_mappings})
+    return found
+
+def update_rule_ip(mapping, new_ip, new_version):
+    """域名IP监控更新 - 修复版：masquerade 匹配目标 IP"""
+    l_port, t_port, protos = mapping.get("local_port"), mapping.get("target_port"), mapping.get("protocols", [])
+    table = "ip" if new_version == 4 else "ip6"
+    addr_family = "ip" if new_version == 4 else "ip6"
     
-    config["rules"].append(rule)
-    save_acl_config(config)
-
-def remove_acl_rule_config(allow_handle):
-    """根据allow_handle删除ACL规则记录"""
-    config = load_acl_config()
-    new_rules = []
-    for r in config["rules"]:
-        if r.get("allow_handle") != allow_handle:
-            new_rules.append(r)
-    config["rules"] = new_rules
-    save_acl_config(config)
-
-# ==================== 守护进程管理 ====================
-
-def daemon_loop():
-    """守护进程主循环"""
-    log_message("守护进程启动")
+    for h in mapping.get("dnat_handles", [mapping.get("handle")]):
+        if h: run_cmd(f"nft delete rule {table} nat prerouting handle {h} 2>/dev/null")
+    for h in mapping.get("masq_handles", []):
+        run_cmd(f"nft delete rule {table} nat postrouting handle {h} 2>/dev/null")
     
-    while True:
-        try:
-            update_domain_ip()
-        except Exception as e:
-            log_message(f"更新出错: {str(e)}")
+    new_d_hs, new_m_hs = [], []
+    p_map = ""
+    if '-' in str(l_port) and l_port != t_port:
+        ls, le = map(int, l_port.split('-'))
+        ts, _ = map(int, t_port.split('-'))
+        p_map = "{ " + ", ".join([f"{ls+i} : {ts+i}" for i in range(le-ls+1)]) + " }"
+    
+    for p in protos:
+        if new_version == 4:
+            cmd = f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to {new_ip}:{t_port}" if not p_map else f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to {new_ip} : {p} dport map {p_map}"
+        else:
+            cmd = f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{new_ip}]:{t_port}" if not p_map else f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{new_ip}] : {p} dport map {p_map}"
         
-        # 每10分钟检查一次
-        time.sleep(600)
+        if run_cmd(cmd)[0]:
+            h_out = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{p} dport {l_port}' | grep -oP 'handle \\d+' | tail -1")[1]
+            m = re.search(r'handle (\d+)', h_out)
+            if m: new_d_hs.append(m.group(1))
+        
+        m_cmd = f"nft add rule {table} nat postrouting {addr_family} daddr {new_ip} {p} dport {t_port} counter masquerade"
+        if run_cmd(m_cmd)[0]:
+            mh_out = run_cmd(f"nft -a list chain {table} nat postrouting | grep '{p} dport {t_port}' | grep 'daddr {new_ip}' | grep -oP 'handle \\d+' | tail -1")[1]
+            mm = re.search(r'handle (\d+)', mh_out)
+            if mm: new_m_hs.append(mm.group(1))
+    
+    mapping["dnat_handles"], mapping["masq_handles"] = new_d_hs, new_m_hs
+    return len(new_d_hs) > 0
 
-def start_daemon():
-    """启动守护进程"""
-    # 检查是否已运行
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE, 'r') as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)
-            print_warning(f"守护进程已在运行 (PID: {pid})")
-            return
-        except (OSError, ValueError):
-            os.remove(PID_FILE)
+def update_domain_ip():
+    """域名 IP 监控守护进程的更新函数"""
+    config = load_domain_config()
+    updated = False
+    for m in config.get("mappings", []):
+        domain = m.get("domain")
+        if not domain or validate_ip(domain)[0]:
+            continue
+        
+        new_ip, new_version = resolve_domain(domain)
+        if new_ip and new_ip != m.get("current_ip"):
+            log_msg = f"[{datetime.now().isoformat()}] 域名 {domain} IP 变更: {m.get('current_ip')} -> {new_ip}"
+            try:
+                with open(LOG_FILE, 'a') as f:
+                    f.write(log_msg + "\n")
+            except:
+                pass
+            
+            if update_rule_ip(m, new_ip, new_version):
+                m["current_ip"] = new_ip
+                m["ip_version"] = new_version
+                m["updated_at"] = datetime.now().isoformat()
+                updated = True
     
-    # Fork进程
-    pid = os.fork()
-    if pid > 0:
-        print_success(f"守护进程已启动 (PID: {pid})")
-        return
-    
-    # 子进程
-    os.setsid()
-    os.umask(0)
-    
-    # 再次fork
-    pid = os.fork()
-    if pid > 0:
-        os._exit(0)
-    
-    # 重定向标准输入输出
-    sys.stdin.close()
-    sys.stdout.close()
-    sys.stderr.close()
-    
-    # 保存PID
-    with open(PID_FILE, 'w') as f:
-        f.write(str(os.getpid()))
-    
-    # 运行守护循环
-    daemon_loop()
+    if updated:
+        save_domain_config(config)
+        save_rules()
 
-def stop_daemon():
-    """停止守护进程"""
-    if not os.path.exists(PID_FILE):
-        print_info("守护进程未运行")
-        return
-    
-    try:
-        with open(PID_FILE, 'r') as f:
-            pid = int(f.read().strip())
-        os.kill(pid, signal.SIGTERM)
-        os.remove(PID_FILE)
-        print_success("守护进程已停止")
-    except (OSError, ValueError) as e:
-        print_error(f"停止守护进程失败: {e}")
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-
-def daemon_status():
-    """检查守护进程状态"""
-    if not os.path.exists(PID_FILE):
-        return False, None
-    
-    try:
-        with open(PID_FILE, 'r') as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True, pid
-    except (OSError, ValueError):
-        return False, None
-
-# ==================== 规则解析 ====================
+# ==================== 规则解析 (精确显示修复版) ====================
 
 def parse_forward_rules():
-    """解析所有转发规则，返回规则列表"""
-    rules = []
-    rule_id = 1
-    
-    # 加载域名配置用于显示
-    domain_config = load_domain_config()
-    handle_to_domain = {}
-    for m in domain_config.get("mappings", []):
-        for h in m.get("handles", []):
-            handle_to_domain[h] = m.get("domain", "")
-    
-    # 解析 IPv4 规则
-    success, stdout, _ = run_cmd("nft -a list chain ip nat prerouting 2>/dev/null")
-    if success:
-        for line in stdout.split('\n'):
-            if 'dnat to' in line:
-                rule = parse_single_rule(line, 'IPv4', rule_id, handle_to_domain)
-                if rule:
-                    rules.append(rule)
-                    rule_id += 1
-    
-    # 解析 IPv6 规则
-    success, stdout, _ = run_cmd("nft -a list chain ip6 nat prerouting 2>/dev/null")
-    if success:
-        for line in stdout.split('\n'):
-            if 'dnat to' in line:
-                rule = parse_single_rule(line, 'IPv6', rule_id, handle_to_domain)
-                if rule:
-                    rules.append(rule)
-                    rule_id += 1
-    
+    rules, rid, config = [], 1, load_domain_config()
+    handle_meta = {}
+    for m in config.get("mappings", []):
+        d_hs = m.get("dnat_handles", [m.get("handle")])
+        for h in d_hs:
+            if h: handle_meta[str(h)] = {"port": m.get("target_port"), "domain": m.get("domain") if not validate_ip(m.get("domain"))[0] else ""}
+            
+    for v in ['IPv4', 'IPv6']:
+        table = "ip" if v == 'IPv4' else "ip6"
+        success, stdout, _ = run_cmd(f"nft -a list chain {table} nat prerouting 2>/dev/null")
+        if success:
+            for line in stdout.split('\n'):
+                if 'dnat to' in line:
+                    r = parse_single_rule(line, v, rid, handle_meta)
+                    if r: rules.append(r); rid += 1
     return rules
 
-def parse_single_rule(line, ip_version, rule_id, handle_to_domain=None):
-    """解析单条规则"""
-    rule = {
-        'id': rule_id,
-        'ip_version': ip_version,
-        'protocol': '',
-        'local_port': '',
-        'target_ip': '',
-        'target_port': '',
-        'handle': '',
-        'packets': 0,
-        'bytes': 0,
-        'domain': '',
-        'raw': line.strip()
-    }
+def parse_single_rule(line, version, rid, meta):
+    r = {'id': rid, 'ip_version': version, 'protocol': 'ALL', 'local_port': '', 'target_ip': '', 'target_port': '', 'handle': '', 'packets': 0, 'bytes': 0, 'domain': ''}
+    if 'tcp dport' in line.lower(): r['protocol'] = 'TCP'
+    elif 'udp dport' in line.lower(): r['protocol'] = 'UDP'
     
-    # 提取协议
-    line_lower = line.lower()
-    if 'tcp dport' in line_lower or 'tcp sport' in line_lower:
-        rule['protocol'] = 'TCP'
-    elif 'udp dport' in line_lower or 'udp sport' in line_lower:
-        rule['protocol'] = 'UDP'
-    elif ' tcp ' in line_lower:
-        rule['protocol'] = 'TCP'
-    elif ' udp ' in line_lower:
-        rule['protocol'] = 'UDP'
-    else:
-        rule['protocol'] = 'ALL'
+    lp_m = re.search(r'dport\s+(\d+(?:-\d+)?)', line)
+    if lp_m: r['local_port'] = lp_m.group(1)
     
-    # 提取本地端口 (dport)
-    dport_match = re.search(r'dport\s+(\d+(?:-\d+)?)', line)
-    if dport_match:
-        rule['local_port'] = dport_match.group(1)
+    h_m = re.search(r'handle\s+(\d+)', line)
+    if h_m: r['handle'] = h_m.group(1)
     
-    # 提取流量统计 - packets X bytes Y
-    counter_match = re.search(r'packets\s+(\d+)\s+bytes\s+(\d+)', line)
-    if counter_match:
-        rule['packets'] = int(counter_match.group(1))
-        rule['bytes'] = int(counter_match.group(2))
-    
-    # 提取目标地址和端口
-    if ip_version == 'IPv4':
-        dnat_match = re.search(r'dnat to\s+([\d.]+)(?::(\d+(?:-\d+)?))?', line)
-        if dnat_match:
-            rule['target_ip'] = dnat_match.group(1)
-            rule['target_port'] = dnat_match.group(2) if dnat_match.group(2) else rule['local_port']
-    else:
-        dnat_match = re.search(r'dnat to\s+\[([^\]]+)\](?::(\d+(?:-\d+)?))?', line)
-        if dnat_match:
-            rule['target_ip'] = dnat_match.group(1)
-            rule['target_port'] = dnat_match.group(2) if dnat_match.group(2) else rule['local_port']
-        else:
-            dnat_match = re.search(r'dnat to\s+([0-9a-fA-F:]+)', line)
-            if dnat_match:
-                rule['target_ip'] = dnat_match.group(1)
-                rule['target_port'] = rule['local_port']
-    
-    # 提取 handle
-    handle_match = re.search(r'handle\s+(\d+)', line)
-    if handle_match:
-        rule['handle'] = handle_match.group(1)
-        # 查找对应的域名
-        if handle_to_domain and rule['handle'] in handle_to_domain:
-            rule['domain'] = handle_to_domain[rule['handle']]
-    
-    if rule['local_port'] and rule['target_ip']:
-        return rule
-    return None
+    c_m = re.search(r'packets\s+(\d+)\s+bytes\s+(\d+)', line)
+    if c_m: r['packets'], r['bytes'] = int(c_m.group(1)), int(c_m.group(2))
 
-def parse_acl_rules():
-    """解析所有ACL访问控制规则"""
-    rules = []
-    rule_id = 1
+    if r['handle'] in meta:
+        r['target_port'] = meta[r['handle']]['port']
+        r['domain'] = meta[r['handle']]['domain']
     
-    # 加载ACL配置
-    acl_config = load_acl_config()
-    handle_to_config = {}
-    for r in acl_config.get("rules", []):
-        if r.get("allow_handle"):
-            handle_to_config[r["allow_handle"]] = r
-    
-    # 解析 IPv4 filter规则
-    success, stdout, _ = run_cmd("nft -a list chain ip filter input 2>/dev/null")
-    if success:
-        for line in stdout.split('\n'):
-            # 只解析包含 saddr 和 dport 且是 accept 的规则（白名单规则）
-            if 'saddr' in line and 'dport' in line and 'accept' in line:
-                rule = parse_single_acl_rule(line, 'IPv4', rule_id, handle_to_config)
-                if rule:
-                    rules.append(rule)
-                    rule_id += 1
-    
-    # 解析 IPv6 filter规则
-    success, stdout, _ = run_cmd("nft -a list chain ip6 filter input 2>/dev/null")
-    if success:
-        for line in stdout.split('\n'):
-            if 'saddr' in line and 'dport' in line and 'accept' in line:
-                rule = parse_single_acl_rule(line, 'IPv6', rule_id, handle_to_config)
-                if rule:
-                    rules.append(rule)
-                    rule_id += 1
-    
-    return rules
-
-def parse_single_acl_rule(line, ip_version, rule_id, handle_to_config=None):
-    """解析单条ACL规则"""
-    rule = {
-        'id': rule_id,
-        'ip_version': ip_version,
-        'protocol': '',
-        'port_range': '',
-        'allowed_ip': '',
-        'handle': '',
-        'drop_handle': '',
-        'packets': 0,
-        'bytes': 0,
-        'raw': line.strip()
-    }
-    
-    # 提取协议
-    line_lower = line.lower()
-    if 'tcp dport' in line_lower:
-        rule['protocol'] = 'TCP'
-    elif 'udp dport' in line_lower:
-        rule['protocol'] = 'UDP'
+    if version == 'IPv4':
+        m = re.search(r'dnat to\s+([\d.]+)(?:\s+:\s+\w+\s+dport\s+map\s+\{[^\}]+\}|:(\d+(?:-\d+)?))?', line)
+        if m: 
+            r['target_ip'] = m.group(1)
+            if not r['target_port']: r['target_port'] = m.group(2) if m.group(2) else r['local_port']
     else:
-        rule['protocol'] = 'ALL'
-    
-    # 提取端口范围
-    dport_match = re.search(r'dport\s+(\d+(?:-\d+)?)', line)
-    if dport_match:
-        rule['port_range'] = dport_match.group(1)
-    
-    # 提取允许的IP/CIDR
-    saddr_match = re.search(r'saddr\s+([\d./]+|[0-9a-fA-F:./]+)', line)
-    if saddr_match:
-        rule['allowed_ip'] = saddr_match.group(1)
-    
-    # 提取流量统计
-    counter_match = re.search(r'packets\s+(\d+)\s+bytes\s+(\d+)', line)
-    if counter_match:
-        rule['packets'] = int(counter_match.group(1))
-        rule['bytes'] = int(counter_match.group(2))
-    
-    # 提取 handle
-    handle_match = re.search(r'handle\s+(\d+)', line)
-    if handle_match:
-        rule['handle'] = handle_match.group(1)
-        # 查找对应的drop handle
-        if handle_to_config and rule['handle'] in handle_to_config:
-            rule['drop_handle'] = handle_to_config[rule['handle']].get('drop_handle', '')
-    
-    if rule['port_range'] and rule['allowed_ip']:
-        return rule
-    return None
+        m = re.search(r'dnat to\s+\[([^\]]+)\](?:\s+:\s+\w+\s+dport\s+map\s+\{[^\}]+\}|:(\d+(?:-\d+)?))?', line)
+        if m: 
+            r['target_ip'] = m.group(1)
+            if not r['target_port']: r['target_port'] = m.group(2) if m.group(2) else r['local_port']
+            
+    return r if r['local_port'] and r['target_ip'] else None
 
-def print_rules_table(rules):
-    """以表格形式打印规则"""
-    if not rules:
-        print_info("当前没有端口转发规则")
-        return
-    
-    # 表格标题
-    headers = ['编号', '协议', '本地端口', '目标地址', '目标端口', '流量', 'IP版本']
-    
-    # 准备数据，生成流量显示字符串
-    for rule in rules:
-        traffic = f"{format_packets(rule['packets'])}包/{format_bytes(rule['bytes'])}"
-        rule['traffic_display'] = traffic
-        # 如果有域名，显示域名
-        if rule['domain']:
-            rule['target_display'] = f"{rule['domain']}"
-        else:
-            rule['target_display'] = rule['target_ip']
-    
-    # 计算每列所需的显示宽度
-    col_widths = []
-    
-    # 编号列
-    col_widths.append(max(
-        get_display_width(headers[0]),
-        max(get_display_width(str(r['id'])) for r in rules)
-    ) + 2)
-    
-    # 协议列
-    col_widths.append(max(
-        get_display_width(headers[1]),
-        max(get_display_width(r['protocol']) for r in rules)
-    ) + 2)
-    
-    # 本地端口列
-    col_widths.append(max(
-        get_display_width(headers[2]),
-        max(get_display_width(r['local_port']) for r in rules)
-    ) + 2)
-    
-    # 目标地址列
-    col_widths.append(max(
-        get_display_width(headers[3]),
-        max(get_display_width(r['target_display']) for r in rules)
-    ) + 2)
-    
-    # 目标端口列
-    col_widths.append(max(
-        get_display_width(headers[4]),
-        max(get_display_width(r['target_port']) for r in rules)
-    ) + 2)
-    
-    # 流量列
-    col_widths.append(max(
-        get_display_width(headers[5]),
-        max(get_display_width(r['traffic_display']) for r in rules)
-    ) + 2)
-    
-    # IP版本列
-    col_widths.append(max(
-        get_display_width(headers[6]),
-        max(get_display_width(r['ip_version']) for r in rules)
-    ) + 2)
-    
-    # 顶部边框
-    print_color("┌" + "┬".join("─" * w for w in col_widths) + "┐", Colors.CYAN)
-    
-    # 标题行
-    header_row = "│"
-    for i, h in enumerate(headers):
-        header_row += pad_to_width(h, col_widths[i]) + "│"
-    print_color(header_row, Colors.CYAN + Colors.BOLD)
-    
-    # 标题分隔线
-    print_color("├" + "┼".join("─" * w for w in col_widths) + "┤", Colors.CYAN)
-    
-    # 数据行
-    for rule in rules:
-        row = "│"
-        row += pad_to_width(str(rule['id']), col_widths[0]) + "│"
-        row += pad_to_width(rule['protocol'], col_widths[1]) + "│"
-        row += pad_to_width(rule['local_port'], col_widths[2]) + "│"
-        row += pad_to_width(rule['target_display'], col_widths[3]) + "│"
-        row += pad_to_width(rule['target_port'], col_widths[4]) + "│"
-        row += pad_to_width(rule['traffic_display'], col_widths[5]) + "│"
-        row += pad_to_width(rule['ip_version'], col_widths[6]) + "│"
-        print(row)
-    
-    # 底部边框
-    print_color("└" + "┴".join("─" * w for w in col_widths) + "┘", Colors.CYAN)
-    
+# ==================== 端口访问限制 (IP 白名单) ====================
+
+def add_acl_rule():
+    """添加端口访问限制规则"""
+    print_header("添加端口访问限制 (IP 白名单)")
+    print_info("此功能将限制指定端口只允许白名单 IP 访问")
     print()
     
-    # 统计总流量
-    total_packets = sum(r['packets'] for r in rules)
-    total_bytes = sum(r['bytes'] for r in rules)
-    print_info(f"共 {len(rules)} 条转发规则 | 总流量: {format_packets(total_packets)} 包 / {format_bytes(total_bytes)}")
+    port = get_input("要限制的端口", validate_port, "1-65535")
+    if not port: return
+    
+    p_choice = get_input("协议 [1.TCP 2.UDP 3.ALL]", lambda x: x in ['1','2','3'], "请输入 1-3", default='3')
+    if not p_choice: return
+    protos = ['tcp'] if p_choice=='1' else ['udp'] if p_choice=='2' else ['tcp', 'udp']
+    
+    v_choice = get_input("IP版本 [1.IPv4 2.IPv6 3.ALL]", lambda x: x in ['1','2','3'], "请输入 1-3", default='1')
+    if not v_choice: return
+    
+    print_info("请输入允许访问的 IP 地址（支持 CIDR 格式，如 192.168.1.0/24）")
+    print_info("多个 IP 用逗号分隔，输入完成后按回车")
+    whitelist_input = get_input("白名单 IP", lambda x: all(validate_ip_or_cidr(ip.strip())[0] for ip in x.split(',')), "IP 格式无效")
+    if not whitelist_input: return
+    
+    whitelist = [ip.strip() for ip in whitelist_input.split(',')]
+    
+    tables = []
+    if v_choice in ['1', '3']: tables.append(('ip', 4))
+    if v_choice in ['2', '3']: tables.append(('ip6', 6))
+    
+    handles = []
+    config = load_acl_config()
+    
+    for table, version in tables:
+        addr_family = "ip" if version == 4 else "ip6"
+        
+        version_whitelist = [ip for ip in whitelist if validate_ip_or_cidr(ip)[1] == version]
+        if not version_whitelist:
+            continue
+        
+        if len(version_whitelist) == 1:
+            ip_set = version_whitelist[0]
+        else:
+            ip_set = "{ " + ", ".join(version_whitelist) + " }"
+        
+        for proto in protos:
+            allow_cmd = f"nft add rule {table} filter input {proto} dport {port} {addr_family} saddr {ip_set} counter accept"
+            success, _, stderr = run_cmd(allow_cmd)
+            if success:
+                h_out = run_cmd(f"nft -a list chain {table} filter input | grep '{proto} dport {port}' | grep 'accept' | grep -oP 'handle \\d+' | tail -1")[1]
+                hm = re.search(r'handle (\d+)', h_out)
+                if hm: handles.append({'table': table, 'chain': 'input', 'handle': hm.group(1), 'type': 'allow'})
+                print_success(f"允许规则添加成功 ({table}/{proto})")
+            else:
+                print_error(f"允许规则添加失败: {stderr}")
+            
+            drop_cmd = f"nft add rule {table} filter input {proto} dport {port} counter drop"
+            success, _, stderr = run_cmd(drop_cmd)
+            if success:
+                h_out = run_cmd(f"nft -a list chain {table} filter input | grep '{proto} dport {port}' | grep 'drop' | grep -oP 'handle \\d+' | tail -1")[1]
+                hm = re.search(r'handle (\d+)', h_out)
+                if hm: handles.append({'table': table, 'chain': 'input', 'handle': hm.group(1), 'type': 'drop'})
+                print_success(f"拒绝规则添加成功 ({table}/{proto})")
+            else:
+                print_error(f"拒绝规则添加失败: {stderr}")
+    
+    if handles:
+        rule_record = {
+            "port": port,
+            "protocols": protos,
+            "whitelist": whitelist,
+            "handles": handles,
+            "created_at": datetime.now().isoformat()
+        }
+        config["rules"].append(rule_record)
+        save_acl_config(config)
+        print_success("端口访问限制已生效")
+    
+    save_rules_prompt()
 
-def print_acl_rules_table(rules):
-    """以表格形式打印ACL规则"""
+def list_acl_rules():
+    """列出所有端口访问限制规则"""
+    print_header("端口访问限制列表")
+    config = load_acl_config()
+    rules = config.get("rules", [])
+    
     if not rules:
         print_info("当前没有端口访问限制规则")
         return
     
-    # 表格标题
-    headers = ['编号', '协议', '端口范围', '允许IP段', '流量', 'IP版本']
+    headers = ['编号', '端口', '协议', '白名单 IP']
+    col_w = [6, 10, 10, 50]
     
-    # 准备数据
-    for rule in rules:
-        traffic = f"{format_packets(rule['packets'])}包/{format_bytes(rule['bytes'])}"
-        rule['traffic_display'] = traffic
+    print_color("┌" + "┬".join("─" * w for w in col_w) + "┐", Colors.CYAN)
+    print_color("│" + "│".join(pad_to_width(h, col_w[i]) for i, h in enumerate(headers)) + "│", Colors.CYAN + Colors.BOLD)
+    print_color("├" + "┼".join("─" * w for w in col_w) + "┤", Colors.CYAN)
     
-    # 计算每列所需的显示宽度
-    col_widths = []
+    for i, r in enumerate(rules, 1):
+        proto_str = '/'.join(p.upper() for p in r.get('protocols', []))
+        whitelist_str = ', '.join(r.get('whitelist', []))
+        if len(whitelist_str) > 48:
+            whitelist_str = whitelist_str[:45] + '...'
+        print(f"│{pad_to_width(i, col_w[0])}│{pad_to_width(r.get('port', ''), col_w[1])}│{pad_to_width(proto_str, col_w[2])}│{pad_to_width(whitelist_str, col_w[3], 'left')}│")
     
-    col_widths.append(max(get_display_width(headers[0]), max(get_display_width(str(r['id'])) for r in rules)) + 2)
-    col_widths.append(max(get_display_width(headers[1]), max(get_display_width(r['protocol']) for r in rules)) + 2)
-    col_widths.append(max(get_display_width(headers[2]), max(get_display_width(r['port_range']) for r in rules)) + 2)
-    col_widths.append(max(get_display_width(headers[3]), max(get_display_width(r['allowed_ip']) for r in rules)) + 2)
-    col_widths.append(max(get_display_width(headers[4]), max(get_display_width(r['traffic_display']) for r in rules)) + 2)
-    col_widths.append(max(get_display_width(headers[5]), max(get_display_width(r['ip_version']) for r in rules)) + 2)
-    
-    # 顶部边框
-    print_color("┌" + "┬".join("─" * w for w in col_widths) + "┐", Colors.CYAN)
-    
-    # 标题行
-    header_row = "│"
-    for i, h in enumerate(headers):
-        header_row += pad_to_width(h, col_widths[i]) + "│"
-    print_color(header_row, Colors.CYAN + Colors.BOLD)
-    
-    # 标题分隔线
-    print_color("├" + "┼".join("─" * w for w in col_widths) + "┤", Colors.CYAN)
-    
-    # 数据行
-    for rule in rules:
-        row = "│"
-        row += pad_to_width(str(rule['id']), col_widths[0]) + "│"
-        row += pad_to_width(rule['protocol'], col_widths[1]) + "│"
-        row += pad_to_width(rule['port_range'], col_widths[2]) + "│"
-        row += pad_to_width(rule['allowed_ip'], col_widths[3]) + "│"
-        row += pad_to_width(rule['traffic_display'], col_widths[4]) + "│"
-        row += pad_to_width(rule['ip_version'], col_widths[5]) + "│"
-        print(row)
-    
-    # 底部边框
-    print_color("└" + "┴".join("─" * w for w in col_widths) + "┘", Colors.CYAN)
-    
-    print()
-    total_packets = sum(r['packets'] for r in rules)
-    total_bytes = sum(r['bytes'] for r in rules)
-    print_info(f"共 {len(rules)} 条访问限制规则 | 总流量: {format_packets(total_packets)} 包 / {format_bytes(total_bytes)}")
+    print_color("└" + "┴".join("─" * w for w in col_w) + "┘", Colors.CYAN)
+    print_info(f"共 {len(rules)} 条访问限制规则")
 
-def show_rules():
-    """显示当前的端口转发规则"""
-    print_header("当前端口转发规则")
-    
-    rules = parse_forward_rules()
-    print_rules_table(rules)
-    
-    # 显示域名监控状态
-    running, pid = daemon_status()
-    if running:
-        print_info(f"域名监控服务运行中 (PID: {pid})")
-    else:
-        config = load_domain_config()
-        if config.get("mappings"):
-            print_warning("域名监控服务未运行，域名IP变化将不会自动更新")
-
-def add_single_port_forward():
-    """添加单端口转发"""
-    print_header("添加单端口转发")
-    print_info("输入 'q' 可随时返回主菜单")
-    print_info("目标地址支持IP地址或域名\n")
-    
-    # 选择协议
-    print("选择协议:")
-    print("  1. TCP")
-    print("  2. UDP")
-    print("  3. TCP + UDP")
-    protocol_choice = get_input(
-        "请选择 [1-3]",
-        lambda x: x in ['1', '2', '3'],
-        "请输入 1、2 或 3",
-        default='3'
-    )
-    if protocol_choice is None:
-        return
-    
-    protocols = []
-    if protocol_choice == '1':
-        protocols = ['tcp']
-    elif protocol_choice == '2':
-        protocols = ['udp']
-    else:
-        protocols = ['tcp', 'udp']
-    
-    # 输入本地端口
-    local_port = get_input(
-        "本地监听端口",
-        validate_port,
-        "端口必须是1-65535之间的数字"
-    )
-    if local_port is None:
-        return
-    
-    # 输入目标地址（IP或域名）
-    target_input = get_input(
-        "目标地址 (IP或域名)",
-        lambda x: validate_target(x)[0],
-        "请输入有效的IP地址或可解析的域名"
-    )
-    if target_input is None:
-        return
-    
-    valid, target_ip, ip_version, is_domain = validate_target(target_input)
-    
-    if is_domain:
-        print_info(f"域名 {target_input} 解析为 {target_ip}")
-    
-    # 输入目标端口
-    target_port = get_input(
-        "目标端口",
-        lambda x: x == '' or validate_port(x),
-        "端口必须是1-65535之间的数字",
-        default=local_port
-    )
-    if target_port is None:
-        return
-    
-    # 确认信息
-    print()
-    print_color("即将添加以下转发规则:", Colors.YELLOW)
-    print(f"  协议: {', '.join(protocols).upper()}")
-    print(f"  本地端口: {local_port}")
-    if is_domain:
-        print(f"  目标域名: {target_input}")
-        print(f"  当前解析IP: {target_ip}")
-    else:
-        print(f"  目标地址: {target_ip}")
-    print(f"  目标端口: {target_port}")
-    print(f"  IP版本: IPv{ip_version}")
-    if is_domain:
-        print_info("域名IP变化时将自动更新规则（需启动守护进程）")
-    print()
-    
-    confirm = input(f"{Colors.CYAN}确认添加？[Y/n]: {Colors.ENDC}").strip().lower()
-    if confirm == 'n':
-        print_warning("已取消操作")
-        return
-    
-    # 执行添加
-    table = "ip" if ip_version == 4 else "ip6"
-    success_count = 0
-    handles = []
-    
-    for proto in protocols:
-        if ip_version == 4:
-            dnat_cmd = f"nft add rule {table} nat prerouting {proto} dport {local_port} counter dnat to {target_ip}:{target_port}"
-        else:
-            dnat_cmd = f"nft add rule {table} nat prerouting {proto} dport {local_port} counter dnat to [{target_ip}]:{target_port}"
-        
-        success, _, stderr = run_cmd(dnat_cmd)
-        if success:
-            success_count += 1
-            # 获取handle
-            success2, stdout, _ = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{proto} dport {local_port}' | grep -oP 'handle \\d+' | tail -1")
-            if success2:
-                handle_match = re.search(r'handle (\d+)', stdout)
-                if handle_match:
-                    handles.append(handle_match.group(1))
-        else:
-            print_error(f"添加 {proto.upper()} DNAT规则失败: {stderr}")
-        
-        # MASQUERADE规则
-        masq_cmd = f"nft add rule {table} nat postrouting {proto} dport {target_port} counter masquerade"
-        run_cmd(masq_cmd)
-    
-    if success_count > 0:
-        print_success(f"成功添加 {success_count} 条转发规则")
-        
-        # 如果是域名，保存映射关系
-        if is_domain:
-            add_domain_mapping(target_input, target_ip, ip_version, local_port, target_port, protocols, handles)
-            print_info(f"已保存域名映射，将每10分钟检查IP变化")
-            
-            # 提示启动守护进程
-            running, _ = daemon_status()
-            if not running:
-                start = input(f"{Colors.CYAN}是否启动域名监控服务？[Y/n]: {Colors.ENDC}").strip().lower()
-                if start != 'n':
-                    start_daemon()
-        
-        save_rules_prompt()
-
-def add_port_range_forward():
-    """添加端口范围转发"""
-    print_header("添加端口范围转发")
-    print_info("输入 'q' 可随时返回主菜单")
-    print_info("目标地址支持IP地址或域名\n")
-    
-    # 选择协议
-    print("选择协议:")
-    print("  1. TCP")
-    print("  2. UDP")
-    print("  3. TCP + UDP")
-    protocol_choice = get_input(
-        "请选择 [1-3]",
-        lambda x: x in ['1', '2', '3'],
-        "请输入 1、2 或 3",
-        default='3'
-    )
-    if protocol_choice is None:
-        return
-    
-    protocols = []
-    if protocol_choice == '1':
-        protocols = ['tcp']
-    elif protocol_choice == '2':
-        protocols = ['udp']
-    else:
-        protocols = ['tcp', 'udp']
-    
-    # 输入起始端口
-    start_port = get_input(
-        "本地起始端口",
-        validate_port,
-        "端口必须是1-65535之间的数字"
-    )
-    if start_port is None:
-        return
-    
-    # 输入结束端口
-    end_port = get_input(
-        "本地结束端口",
-        lambda x: validate_port(x) and int(x) >= int(start_port),
-        f"端口必须是{start_port}-65535之间的数字"
-    )
-    if end_port is None:
-        return
-    
-    # 输入目标地址
-    target_input = get_input(
-        "目标地址 (IP或域名)",
-        lambda x: validate_target(x)[0],
-        "请输入有效的IP地址或可解析的域名"
-    )
-    if target_input is None:
-        return
-    
-    valid, target_ip, ip_version, is_domain = validate_target(target_input)
-    
-    if is_domain:
-        print_info(f"域名 {target_input} 解析为 {target_ip}")
-    
-    # 选择端口映射方式
-    print()
-    print("端口映射方式:")
-    print("  1. 保持原端口 (本地端口1000-1100 -> 目标端口1000-1100)")
-    print("  2. 指定目标起始端口 (本地端口1000-1100 -> 目标端口2000-2100)")
-    mapping_choice = get_input(
-        "请选择 [1-2]",
-        lambda x: x in ['1', '2'],
-        "请输入 1 或 2",
-        default='1'
-    )
-    if mapping_choice is None:
-        return
-    
-    if mapping_choice == '1':
-        target_start_port = start_port
-    else:
-        target_start_port = get_input(
-            "目标起始端口",
-            validate_port,
-            "端口必须是1-65535之间的数字"
-        )
-        if target_start_port is None:
-            return
-    
-    # 计算目标结束端口
-    port_count = int(end_port) - int(start_port)
-    target_end_port = int(target_start_port) + port_count
-    
-    if target_end_port > 65535:
-        print_error(f"目标端口范围超出限制 (结束端口: {target_end_port} > 65535)")
-        return
-    
-    # 确认信息
-    print()
-    print_color("即将添加以下转发规则:", Colors.YELLOW)
-    print(f"  协议: {', '.join(protocols).upper()}")
-    print(f"  本地端口范围: {start_port}-{end_port}")
-    if is_domain:
-        print(f"  目标域名: {target_input}")
-        print(f"  当前解析IP: {target_ip}")
-    else:
-        print(f"  目标地址: {target_ip}")
-    print(f"  目标端口范围: {target_start_port}-{target_end_port}")
-    print(f"  IP版本: IPv{ip_version}")
-    print()
-    
-    confirm = input(f"{Colors.CYAN}确认添加？[Y/n]: {Colors.ENDC}").strip().lower()
-    if confirm == 'n':
-        print_warning("已取消操作")
-        return
-    
-    # 执行添加
-    table = "ip" if ip_version == 4 else "ip6"
-    success_count = 0
-    handles = []
-    local_port_str = f"{start_port}-{end_port}"
-    target_port_str = f"{target_start_port}-{target_end_port}" if target_start_port != start_port else local_port_str
-    
-    for proto in protocols:
-        if ip_version == 4:
-            if start_port == target_start_port:
-                dnat_cmd = f"nft add rule {table} nat prerouting {proto} dport {start_port}-{end_port} counter dnat to {target_ip}"
-            else:
-                dnat_cmd = f"nft add rule {table} nat prerouting {proto} dport {start_port}-{end_port} counter dnat to {target_ip}:{target_start_port}-{target_end_port}"
-        else:
-            if start_port == target_start_port:
-                dnat_cmd = f"nft add rule {table} nat prerouting {proto} dport {start_port}-{end_port} counter dnat to {target_ip}"
-            else:
-                dnat_cmd = f"nft add rule {table} nat prerouting {proto} dport {start_port}-{end_port} counter dnat to [{target_ip}]:{target_start_port}-{target_end_port}"
-        
-        success, _, stderr = run_cmd(dnat_cmd)
-        if success:
-            success_count += 1
-            # 获取handle
-            success2, stdout, _ = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{proto} dport {start_port}-{end_port}' | grep -oP 'handle \\d+' | tail -1")
-            if success2:
-                handle_match = re.search(r'handle (\d+)', stdout)
-                if handle_match:
-                    handles.append(handle_match.group(1))
-        else:
-            print_error(f"添加 {proto.upper()} DNAT规则失败: {stderr}")
-        
-        # MASQUERADE规则
-        masq_cmd = f"nft add rule {table} nat postrouting {proto} dport {target_start_port}-{target_end_port} counter masquerade"
-        run_cmd(masq_cmd)
-    
-    if success_count > 0:
-        print_success(f"成功添加 {success_count} 条端口范围转发规则")
-        
-        # 如果是域名，保存映射关系
-        if is_domain:
-            add_domain_mapping(target_input, target_ip, ip_version, local_port_str, target_port_str, protocols, handles)
-            print_info(f"已保存域名映射，将每10分钟检查IP变化")
-            
-            running, _ = daemon_status()
-            if not running:
-                start = input(f"{Colors.CYAN}是否启动域名监控服务？[Y/n]: {Colors.ENDC}").strip().lower()
-                if start != 'n':
-                    start_daemon()
-        
-        save_rules_prompt()
-
-def delete_rule():
-    """删除规则"""
-    print_header("删除转发规则")
-    
-    rules = parse_forward_rules()
+def delete_acl_rule():
+    """删除端口访问限制规则"""
+    print_header("删除端口访问限制")
+    config = load_acl_config()
+    rules = config.get("rules", [])
     
     if not rules:
-        print_info("当前没有可删除的转发规则")
+        print_info("当前没有端口访问限制规则")
         return
     
-    print_rules_table(rules)
+    list_acl_rules()
     
-    print_info("输入 'q' 返回主菜单\n")
+    idx = get_input("要删除的编号", lambda x: x.isdigit() and 1 <= int(x) <= len(rules), f"1-{len(rules)}")
+    if not idx: return
     
-    rule_id = get_input(
-        "请输入要删除的规则编号",
-        lambda x: x.isdigit() and 1 <= int(x) <= len(rules),
-        f"请输入 1-{len(rules)} 之间的数字"
-    )
-    if rule_id is None:
+    rule = rules[int(idx) - 1]
+    
+    if input(f"{Colors.RED}确认删除端口 {rule.get('port')} 的访问限制？[y/N]: {Colors.ENDC}").lower() != 'y':
         return
     
-    rule = rules[int(rule_id) - 1]
+    for h in rule.get('handles', []):
+        table = h.get('table', 'ip')
+        chain = h.get('chain', 'input')
+        handle = h.get('handle')
+        if handle:
+            run_cmd(f"nft delete rule {table} filter {chain} handle {handle} 2>/dev/null")
     
-    print()
-    print_color("即将删除以下规则:", Colors.YELLOW)
-    print(f"  协议: {rule['protocol']}")
-    print(f"  本地端口: {rule['local_port']}")
-    if rule['domain']:
-        print(f"  目标域名: {rule['domain']}")
-    print(f"  目标地址: {rule['target_ip']}:{rule['target_port']}")
-    print(f"  已用流量: {format_packets(rule['packets'])} 包 / {format_bytes(rule['bytes'])}")
-    print(f"  IP版本: {rule['ip_version']}")
-    print()
-    
-    confirm = input(f"{Colors.CYAN}确认删除？[y/N]: {Colors.ENDC}").strip().lower()
-    if confirm != 'y':
-        print_warning("已取消操作")
-        return
-    
-    table = "ip" if rule['ip_version'] == 'IPv4' else "ip6"
-    cmd = f"nft delete rule {table} nat prerouting handle {rule['handle']}"
-    success, _, stderr = run_cmd(cmd)
-    
-    if success:
-        # 删除域名映射
-        if rule['handle']:
-            remove_domain_mapping_by_handle(rule['handle'])
-        print_success("规则删除成功")
-        save_rules_prompt()
-    else:
-        print_error(f"删除失败: {stderr}")
+    rules.pop(int(idx) - 1)
+    save_acl_config(config)
+    print_success("访问限制规则已删除")
+    save_rules_prompt()
 
-def flush_rules():
-    """清空所有规则"""
-    print_header("清空所有转发规则")
+def acl_menu():
+    """端口访问限制菜单"""
+    while True:
+        print_header("端口访问限制 (IP 白名单)")
+        print("  1. 添加访问限制")
+        print("  2. 查看限制列表")
+        print("  3. 删除访问限制")
+        print("  0. 返回主菜单")
+        print()
+        
+        c = input(f"{Colors.CYAN}请选择: {Colors.ENDC}").strip()
+        
+        if c == '1': add_acl_rule()
+        elif c == '2': list_acl_rules()
+        elif c == '3': delete_acl_rule()
+        elif c == '0': return
+        
+        input(f"\n{Colors.DIM}按回车键继续...{Colors.ENDC}")
+
+# ==================== 核心功能执行 (链式转发修复版) ====================
+
+def add_single_port_forward():
+    print_header("添加单端口转发")
+    p_choice = get_input("协议 [1.TCP 2.UDP 3.ALL]", lambda x: x in ['1','2','3'], "请输入 1-3", default='3')
+    if not p_choice: return
+    protos = ['tcp'] if p_choice=='1' else ['udp'] if p_choice=='2' else ['tcp','udp']
+    l_port = get_input("本地端口", validate_port, "1-65535")
+    if not l_port: return
+    target_in = get_input("目标地址 (IP/域名)", lambda x: validate_target(x)[0], "地址无效")
+    if not target_in: return
+    _, t_ip, v, is_domain = validate_target(target_in)
+    t_port = get_input("目标端口", lambda x: x=='' or validate_port(x), "1-65535", default=l_port)
     
+    table = "ip" if v == 4 else "ip6"
+    addr_family = "ip" if v == 4 else "ip6"
+    d_hs, m_hs = [], []
+    
+    for p in protos:
+        if v == 4:
+            cmd = f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to {t_ip}:{t_port}"
+        else:
+            cmd = f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{t_ip}]:{t_port}"
+        
+        if run_cmd(cmd)[0]:
+            h_out = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{p} dport {l_port}' | grep -oP 'handle \\d+' | tail -1")[1]
+            dm = re.search(r'handle (\d+)', h_out)
+            if dm: d_hs.append(dm.group(1))
+        
+        m_cmd = f"nft add rule {table} nat postrouting {addr_family} daddr {t_ip} {p} dport {t_port} counter masquerade"
+        if run_cmd(m_cmd)[0]:
+            mh_out = run_cmd(f"nft -a list chain {table} nat postrouting | grep '{p} dport {t_port}' | grep 'daddr {t_ip}' | grep -oP 'handle \\d+' | tail -1")[1]
+            mm = re.search(r'handle (\d+)', mh_out)
+            if mm: m_hs.append(mm.group(1))
+            
+    if d_hs:
+        add_mapping_record(target_in, t_ip, v, l_port, t_port, protos, d_hs, m_hs)
+        print_success("规则已添加并同步至数据库")
+        if is_domain: start_daemon()
+    save_rules_prompt()
+
+def add_port_range_forward():
+    print_header("添加范围转发 (1:1 映射修复版)")
+    p_choice = get_input("协议 [1.TCP 2.UDP 3.ALL]", lambda x: x in ['1','2','3'], "1-3", default='3')
+    if not p_choice: return
+    protos = ['tcp'] if p_choice=='1' else ['udp'] if p_choice=='2' else ['tcp','udp']
+    sp = get_input("起始端口", validate_port, "1-65535")
+    ep = get_input("结束端口", lambda x: validate_port(x) and int(x)>=int(sp), f"{sp}-65535")
+    if not ep: return
+    target_in = get_input("目标地址", lambda x: validate_target(x)[0], "地址无效")
+    if not target_in: return
+    _, t_ip, v, is_domain = validate_target(target_in)
+    tsp = get_input("目标起始端口", validate_port, "1-65535", default=sp)
+    
+    count = int(ep) - int(sp)
+    tep = int(tsp) + count
+    entries = [f"{int(sp)+i} : {int(tsp)+i}" for i in range(count + 1)]
+    p_map = "{ " + ", ".join(entries) + " }"
+    
+    table = "ip" if v == 4 else "ip6"
+    addr_family = "ip" if v == 4 else "ip6"
+    d_hs, m_hs = [], []
+    
+    for p in protos:
+        if sp == tsp:
+            if v == 4:
+                cmd = f"nft add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to {t_ip}"
+            else:
+                cmd = f"nft add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to [{t_ip}]"
+        else:
+            ip_p = t_ip if v == 4 else f"[{t_ip}]"
+            cmd = f"nft add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to {ip_p} : {p} dport map {p_map}"
+        
+        if run_cmd(cmd)[0]:
+            h_out = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{p} dport {sp}-{ep}' | grep -oP 'handle \\d+' | tail -1")[1]
+            dm = re.search(r'handle (\d+)', h_out)
+            if dm: d_hs.append(dm.group(1))
+        
+        m_cmd = f"nft add rule {table} nat postrouting {addr_family} daddr {t_ip} {p} dport {tsp}-{tep} counter masquerade"
+        if run_cmd(m_cmd)[0]:
+            mh_out = run_cmd(f"nft -a list chain {table} nat postrouting | grep '{p} dport {tsp}-{tep}' | grep 'daddr {t_ip}' | grep -oP 'handle \\d+' | tail -1")[1]
+            mm = re.search(r'handle (\d+)', mh_out)
+            if mm: m_hs.append(mm.group(1))
+
+    if d_hs:
+        add_mapping_record(target_in, t_ip, v, f"{sp}-{ep}", f"{tsp}-{tep}", protos, d_hs, m_hs)
+        print_success("1:1 范围映射已添加")
+        if is_domain: start_daemon()
+    save_rules_prompt()
+
+def delete_rule():
+    """彻底删除 (修复版：确保 IP 转发也能物理清理)"""
+    print_header("删除转发规则")
     rules = parse_forward_rules()
     if not rules:
         print_info("当前没有转发规则")
         return
-    
     print_rules_table(rules)
+    idx = get_input("编号", lambda x: x.isdigit() and 1<=int(x)<=len(rules), f"1-{len(rules)}")
+    if not idx: return
+    r = rules[int(idx)-1]
+    if input(f"{Colors.RED}确认删除？[y/N]: {Colors.ENDC}").lower() != 'y': return
     
-    print_warning("此操作将删除上述所有NAT规则！")
-    
-    confirm = input(f"{Colors.RED}确认清空所有规则？请输入 'yes' 确认: {Colors.ENDC}").strip().lower()
-    if confirm != 'yes':
-        print_warning("已取消操作")
-        return
-    
-    run_cmd("nft flush table ip nat")
-    run_cmd("nft flush table ip6 nat")
-    
-    # 清空域名配置
-    save_domain_config({"mappings": []})
-    
-    print_success("所有NAT规则已清空")
-    
-    init_nat_table()
-    print_info("已重新初始化NAT链")
+    if not remove_mapping_by_handle(r['handle']):
+        table = "ip" if r['ip_version'] == 'IPv4' else "ip6"
+        run_cmd(f"nft delete rule {table} nat prerouting handle {r['handle']} 2>/dev/null")
+        print_success("DNAT 规则已删除")
+    else:
+        print_success("已连带清理转发记录及伪装规则")
     save_rules_prompt()
+
+# ==================== 界面展示 ====================
+
+def print_rules_table(rules):
+    if not rules:
+        print_info("当前没有转发规则")
+        return
+    headers = ['编号', '协议', '本地端口', '目标地址', '目标端口', '流量', 'IP版本']
+    col_w = [6, 6, 15, 20, 15, 18, 8]
+    print_color("┌" + "┬".join("─" * w for w in col_w) + "┐", Colors.CYAN)
+    print_color("│" + "│".join(pad_to_width(h, col_w[i]) for i, h in enumerate(headers)) + "│", Colors.CYAN + Colors.BOLD)
+    print_color("├" + "┼".join("─" * w for w in col_w) + "┤", Colors.CYAN)
+    
+    total_packets, total_bytes = 0, 0
+    for r in rules:
+        traffic = f"{format_packets(r['packets'])}包/{format_bytes(r['bytes'])}"
+        target = r['domain'] if r['domain'] else r['target_ip']
+        total_packets += r['packets']
+        total_bytes += r['bytes']
+        print(f"│{pad_to_width(r['id'], col_w[0])}│{pad_to_width(r['protocol'], col_w[1])}│{pad_to_width(r['local_port'], col_w[2])}│{pad_to_width(target, col_w[3])}│{pad_to_width(r['target_port'], col_w[4])}│{pad_to_width(traffic, col_w[5])}│{pad_to_width(r['ip_version'], col_w[6])}│")
+    
+    print_color("└" + "┴".join("─" * w for w in col_w) + "┘", Colors.CYAN)
+    print_info(f"共 {len(rules)} 条转发规则 | 总流量: {format_packets(total_packets)} 包 / {format_bytes(total_bytes)}")
 
 def save_rules():
-    """保存规则到文件"""
-    success, stdout, _ = run_cmd("nft list ruleset")
-    if success:
+    ok, out, _ = run_cmd("nft list ruleset")
+    if ok:
         with open("/etc/nftables.conf", "w") as f:
-            f.write("#!/usr/sbin/nft -f\n\n")
-            f.write("flush ruleset\n\n")
-            f.write(stdout)
-        print_success("规则已保存到 /etc/nftables.conf")
-        print_info("规则将在系统重启后自动加载")
-    else:
-        print_error("保存规则失败")
+            f.write("#!/usr/sbin/nft -f\n\nflush ruleset\n\n" + out)
+        print_success("已保存至 /etc/nftables.conf")
 
 def save_rules_prompt():
-    """询问是否保存规则"""
-    save = input(f"\n{Colors.CYAN}是否保存规则以便重启后生效？[Y/n]: {Colors.ENDC}").strip().lower()
-    if save != 'n':
-        save_rules()
+    if input(f"\n{Colors.CYAN}是否保存配置？[Y/n]: {Colors.ENDC}").lower() != 'n': save_rules()
 
-# ==================== 端口访问限制功能 ====================
+def daemon_status():
+    if not os.path.exists(PID_FILE): return False, None
+    try:
+        with open(PID_FILE, 'r') as f: pid = int(f.read().strip())
+        os.kill(pid, 0); return True, pid
+    except: return False, None
 
-def manage_port_acl():
-    """管理端口访问限制"""
-    print_header("端口访问限制（IP白名单）")
-    
-    print("操作选项:")
-    print("  1. 添加访问限制")
-    print("  2. 查看访问限制规则")
-    print("  3. 删除访问限制")
-    print("  4. 清空所有访问限制")
-    print("  0. 返回")
-    print()
-    
-    choice = get_input("请选择", lambda x: x in ['0', '1', '2', '3', '4'], "请输入 0-4")
-    if choice is None or choice == '0':
+def start_daemon():
+    r, _ = daemon_status()
+    if r:
+        print_info("域名监控守护进程已在运行")
         return
-    
-    if choice == '1':
-        add_port_acl()
-    elif choice == '2':
-        show_port_acl()
-    elif choice == '3':
-        delete_port_acl()
-    elif choice == '4':
-        flush_port_acl()
+    pid = os.fork()
+    if pid > 0:
+        print_success("域名监控守护进程已启动")
+        return
+    os.setsid()
+    if os.fork() > 0: os._exit(0)
+    with open(PID_FILE, 'w') as f: f.write(str(os.getpid()))
+    while True:
+        try: update_domain_ip()
+        except: pass
+        time.sleep(600)
 
-def add_port_acl():
-    """添加端口访问限制"""
-    print_header("添加端口访问限制")
-    print_info("输入 'q' 可随时返回")
-    print_info("此功能限制只有指定IP段可以访问指定端口\n")
-    
-    # 初始化filter表
-    init_filter_table()
-    
-    # 选择协议
-    print("选择协议:")
-    print("  1. TCP")
-    print("  2. UDP")
-    print("  3. TCP + UDP")
-    protocol_choice = get_input(
-        "请选择 [1-3]",
-        lambda x: x in ['1', '2', '3'],
-        "请输入 1、2 或 3",
-        default='3'
-    )
-    if protocol_choice is None:
-        return
-    
-    protocols = []
-    if protocol_choice == '1':
-        protocols = ['tcp']
-    elif protocol_choice == '2':
-        protocols = ['udp']
-    else:
-        protocols = ['tcp', 'udp']
-    
-    # 输入端口范围
-    print()
-    print_info("端口范围格式: 单端口如 '10000' 或范围如 '10000-10100'")
-    port_range = get_input(
-        "限制端口范围",
-        validate_port_range,
-        "请输入有效的端口或端口范围 (如: 10000 或 10000-10100)"
-    )
-    if port_range is None:
-        return
-    
-    # 格式化端口范围（单端口转为范围格式）
-    if '-' not in port_range:
-        port_range_display = port_range
-        port_range_nft = port_range
-    else:
-        port_range_display = port_range
-        port_range_nft = port_range
-    
-    # 输入允许的IP段
-    print()
-    print_info("IP段格式: 单个IP如 '192.168.1.100' 或CIDR如 '192.168.1.0/24'")
-    allowed_ip = get_input(
-        "允许访问的IP段",
-        lambda x: validate_ip(x)[0] or validate_cidr(x)[0],
-        "请输入有效的IP地址或CIDR格式的IP段",
-        default='127.0.0.1'
-    )
-    if allowed_ip is None:
-        return
-    
-    # 判断IP版本
-    valid_ip, ip_version = validate_ip(allowed_ip)
-    if not valid_ip:
-        valid_cidr, ip_version = validate_cidr(allowed_ip)
-    
-    if ip_version is None:
-        print_error("无法确定IP版本")
-        return
-    
-    # 确认信息
-    print()
-    print_color("即将添加以下访问限制:", Colors.YELLOW)
-    print(f"  协议: {', '.join(protocols).upper()}")
-    print(f"  限制端口: {port_range_display}")
-    print(f"  允许IP段: {allowed_ip}")
-    print(f"  IP版本: IPv{ip_version}")
-    print()
-    print_warning("注意: 添加后，只有指定IP段可以访问该端口，其他IP将被拒绝！")
-    print()
-    
-    confirm = input(f"{Colors.CYAN}确认添加？[Y/n]: {Colors.ENDC}").strip().lower()
-    if confirm == 'n':
-        print_warning("已取消操作")
-        return
-    
-    # 执行添加
-    table = "ip" if ip_version == 4 else "ip6"
-    saddr_key = "ip saddr" if ip_version == 4 else "ip6 saddr"
-    success_count = 0
-    
-    for proto in protocols:
-        # 1. 添加允许规则（白名单IP）
-        allow_cmd = f"nft add rule {table} filter input {proto} dport {port_range_nft} {saddr_key} {allowed_ip} counter accept"
-        success1, _, stderr1 = run_cmd(allow_cmd)
-        
-        if not success1:
-            print_error(f"添加 {proto.upper()} 允许规则失败: {stderr1}")
-            continue
-        
-        # 获取allow规则的handle
-        success_h1, stdout_h1, _ = run_cmd(f"nft -a list chain {table} filter input | grep '{proto} dport {port_range_nft}' | grep 'accept' | grep -oP 'handle \\d+' | tail -1")
-        allow_handle = ""
-        if success_h1:
-            handle_match = re.search(r'handle (\d+)', stdout_h1)
-            if handle_match:
-                allow_handle = handle_match.group(1)
-        
-        # 2. 添加拒绝规则（其他IP）
-        drop_cmd = f"nft add rule {table} filter input {proto} dport {port_range_nft} counter drop"
-        success2, _, stderr2 = run_cmd(drop_cmd)
-        
-        if not success2:
-            print_error(f"添加 {proto.upper()} 拒绝规则失败: {stderr2}")
-            # 回滚允许规则
-            if allow_handle:
-                run_cmd(f"nft delete rule {table} filter input handle {allow_handle}")
-            continue
-        
-        # 获取drop规则的handle
-        success_h2, stdout_h2, _ = run_cmd(f"nft -a list chain {table} filter input | grep '{proto} dport {port_range_nft}' | grep 'drop' | grep -oP 'handle \\d+' | tail -1")
-        drop_handle = ""
-        if success_h2:
-            handle_match = re.search(r'handle (\d+)', stdout_h2)
-            if handle_match:
-                drop_handle = handle_match.group(1)
-        
-        # 保存到配置
-        add_acl_rule_config(port_range_display, allowed_ip, [proto], ip_version, allow_handle, drop_handle)
-        success_count += 1
-    
-    if success_count > 0:
-        print_success(f"成功添加 {success_count} 条访问限制规则")
-        save_rules_prompt()
-    else:
-        print_error("添加访问限制失败")
-
-def show_port_acl():
-    """查看端口访问限制规则"""
-    print_header("当前端口访问限制规则")
-    
-    rules = parse_acl_rules()
-    print_acl_rules_table(rules)
-
-def delete_port_acl():
-    """删除端口访问限制"""
-    print_header("删除端口访问限制")
-    
-    rules = parse_acl_rules()
-    
-    if not rules:
-        print_info("当前没有可删除的访问限制规则")
-        return
-    
-    print_acl_rules_table(rules)
-    
-    print_info("输入 'q' 返回\n")
-    
-    rule_id = get_input(
-        "请输入要删除的规则编号",
-        lambda x: x.isdigit() and 1 <= int(x) <= len(rules),
-        f"请输入 1-{len(rules)} 之间的数字"
-    )
-    if rule_id is None:
-        return
-    
-    rule = rules[int(rule_id) - 1]
-    
-    print()
-    print_color("即将删除以下访问限制:", Colors.YELLOW)
-    print(f"  协议: {rule['protocol']}")
-    print(f"  端口范围: {rule['port_range']}")
-    print(f"  允许IP段: {rule['allowed_ip']}")
-    print(f"  IP版本: {rule['ip_version']}")
-    print()
-    print_warning("删除后，该端口将对所有IP开放访问！")
-    print()
-    
-    confirm = input(f"{Colors.CYAN}确认删除？[y/N]: {Colors.ENDC}").strip().lower()
-    if confirm != 'y':
-        print_warning("已取消操作")
-        return
-    
-    table = "ip" if rule['ip_version'] == 'IPv4' else "ip6"
-    
-    # 删除允许规则
-    if rule['handle']:
-        cmd1 = f"nft delete rule {table} filter input handle {rule['handle']}"
-        run_cmd(cmd1)
-    
-    # 删除拒绝规则
-    if rule['drop_handle']:
-        cmd2 = f"nft delete rule {table} filter input handle {rule['drop_handle']}"
-        run_cmd(cmd2)
-    
-    # 从配置中删除
-    if rule['handle']:
-        remove_acl_rule_config(rule['handle'])
-    
-    print_success("访问限制规则删除成功")
-    save_rules_prompt()
-
-def flush_port_acl():
-    """清空所有端口访问限制"""
-    print_header("清空所有端口访问限制")
-    
-    rules = parse_acl_rules()
-    if not rules:
-        print_info("当前没有访问限制规则")
-        return
-    
-    print_acl_rules_table(rules)
-    
-    print_warning("此操作将删除所有端口访问限制规则！")
-    print_warning("删除后，所有端口将对所有IP开放！")
-    
-    confirm = input(f"{Colors.RED}确认清空所有访问限制？请输入 'yes' 确认: {Colors.ENDC}").strip().lower()
-    if confirm != 'yes':
-        print_warning("已取消操作")
-        return
-    
-    # 清空filter表的input链规则
-    run_cmd("nft flush chain ip filter input 2>/dev/null")
-    run_cmd("nft flush chain ip6 filter input 2>/dev/null")
-    
-    # 清空ACL配置
-    save_acl_config({"rules": []})
-    
-    print_success("所有访问限制规则已清空")
-    save_rules_prompt()
-
-# ==================== 其他功能 ====================
-
-def manage_daemon():
-    """管理守护进程"""
-    print_header("域名监控服务管理")
-    
+def stop_daemon():
     running, pid = daemon_status()
-    
-    if running:
-        print_success(f"服务状态: 运行中 (PID: {pid})")
+    if running and pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            os.remove(PID_FILE)
+            print_success("守护进程已停止")
+        except:
+            print_error("停止守护进程失败")
     else:
-        print_warning("服务状态: 未运行")
-    
-    # 显示域名映射
-    config = load_domain_config()
-    mappings = config.get("mappings", [])
-    
-    if mappings:
-        print()
-        print_color("当前域名映射:", Colors.YELLOW)
-        for m in mappings:
-            print(f"  {m['domain']} -> {m['current_ip']} (端口 {m['local_port']} -> {m['target_port']})")
-            print(f"    更新时间: {m.get('updated_at', 'N/A')}")
-    
-    print()
-    print("操作选项:")
-    print("  1. 启动服务")
-    print("  2. 停止服务")
-    print("  3. 重启服务")
-    print("  4. 立即更新域名IP")
-    print("  5. 查看日志")
-    print("  0. 返回")
-    print()
-    
-    choice = get_input("请选择", lambda x: x in ['0', '1', '2', '3', '4', '5'], "请输入 0-5")
-    if choice is None or choice == '0':
-        return
-    
-    if choice == '1':
-        start_daemon()
-    elif choice == '2':
-        stop_daemon()
-    elif choice == '3':
-        stop_daemon()
-        time.sleep(1)
-        start_daemon()
-    elif choice == '4':
-        print_info("正在更新域名IP...")
-        update_domain_ip()
-        print_success("更新完成")
-    elif choice == '5':
-        if os.path.exists(LOG_FILE):
-            success, stdout, _ = run_cmd(f"tail -50 {LOG_FILE}")
-            if success:
-                print()
-                print_color("最近日志:", Colors.YELLOW)
-                print(stdout)
-        else:
-            print_info("日志文件不存在")
+        print_info("守护进程未在运行")
 
-def show_status():
-    """显示系统状态"""
+def show_system_status():
     print_header("系统状态")
     
-    # IP转发状态
-    success, stdout, _ = run_cmd("cat /proc/sys/net/ipv4/ip_forward")
-    ipv4_forward = stdout.strip() == '1'
-    success, stdout, _ = run_cmd("cat /proc/sys/net/ipv6/conf/all/forwarding")
-    ipv6_forward = stdout.strip() == '1'
+    _, ipv4_fwd, _ = run_cmd("cat /proc/sys/net/ipv4/ip_forward")
+    _, ipv6_fwd, _ = run_cmd("cat /proc/sys/net/ipv6/conf/all/forwarding")
+    print(f"  IPv4 转发: {'✓ 已启用' if ipv4_fwd.strip() == '1' else '✗ 未启用'}")
+    print(f"  IPv6 转发: {'✓ 已启用' if ipv6_fwd.strip() == '1' else '✗ 未启用'}")
     
-    print_color("【IP转发状态】", Colors.YELLOW + Colors.BOLD)
-    print(f"  IPv4 转发: {'✓ 已启用' if ipv4_forward else '✗ 未启用'}")
-    print(f"  IPv6 转发: {'✓ 已启用' if ipv6_forward else '✗ 未启用'}")
-    print()
-    
-    # nftables服务状态
-    success, stdout, _ = run_cmd("systemctl is-active nftables")
-    nft_active = stdout.strip() == 'active'
-    
-    print_color("【nftables服务】", Colors.YELLOW + Colors.BOLD)
-    print(f"  服务状态: {'✓ 运行中' if nft_active else '✗ 未运行'}")
-    
-    # 守护进程状态
     running, pid = daemon_status()
-    print()
-    print_color("【域名监控服务】", Colors.YELLOW + Colors.BOLD)
-    if running:
-        print(f"  服务状态: ✓ 运行中 (PID: {pid})")
-    else:
-        print(f"  服务状态: ✗ 未运行")
+    print(f"  域名监控: {'✓ 运行中 (PID: ' + str(pid) + ')' if running else '✗ 未运行'}")
     
-    # 规则统计
     rules = parse_forward_rules()
-    ipv4_count = sum(1 for r in rules if r['ip_version'] == 'IPv4')
-    ipv6_count = sum(1 for r in rules if r['ip_version'] == 'IPv6')
-    total_packets = sum(r['packets'] for r in rules)
-    total_bytes = sum(r['bytes'] for r in rules)
+    print(f"  转发规则: {len(rules)} 条")
     
-    print()
-    print_color("【转发规则统计】", Colors.YELLOW + Colors.BOLD)
-    print(f"  IPv4 转发规则数: {ipv4_count}")
-    print(f"  IPv6 转发规则数: {ipv6_count}")
-    print(f"  总计: {len(rules)}")
-    print(f"  总流量: {format_packets(total_packets)} 包 / {format_bytes(total_bytes)}")
-    
-    # ACL规则统计
-    acl_rules = parse_acl_rules()
-    print()
-    print_color("【访问限制规则统计】", Colors.YELLOW + Colors.BOLD)
-    print(f"  访问限制规则数: {len(acl_rules)}")
-    
-    # 域名映射统计
     config = load_domain_config()
-    domain_count = len(config.get("mappings", []))
-    if domain_count > 0:
-        print()
-        print_color("【域名映射】", Colors.YELLOW + Colors.BOLD)
-        print(f"  域名规则数: {domain_count}")
+    domain_count = sum(1 for m in config.get("mappings", []) if not validate_ip(m.get("domain", ""))[0])
+    print(f"  域名映射: {domain_count} 个")
+    
+    acl_config = load_acl_config()
+    acl_count = len(acl_config.get("rules", []))
+    print(f"  访问限制: {acl_count} 条")
 
 def show_help():
-    """显示帮助信息"""
-    print_header("帮助信息")
-    
-    print_color("【关于端口转发】", Colors.YELLOW + Colors.BOLD)
+    print_header("使用帮助")
     print("""
-端口转发允许将发送到本机某端口的流量转发到另一个IP地址和端口。
-常见用途包括：
-  - 将流量转发到内网服务器
-  - NAT穿透
-  - 负载均衡前端
+  本工具用于管理 nftables 端口转发规则。
 
-【使用说明】
-  1. 添加单端口转发：将单个端口的流量转发到目标地址
-  2. 添加端口范围转发：将连续端口的流量转发到目标地址
-  3. 查看规则：以表格形式显示当前配置的所有转发规则
-  4. 删除规则：选择编号删除指定规则
-  5. 清空规则：删除所有NAT规则（谨慎使用）
-  6. 域名服务：管理域名动态解析服务
+  【链式转发说明】
+  本版本已修复链式转发问题。masquerade 规则现在会匹配目标 IP，
+  确保 A -> B -> C 的多级转发能正常工作。
 
-【端口访问限制（IP白名单）】
-  - 限制指定端口只允许特定IP段访问
-  - 支持单个IP或CIDR格式的IP段
-  - 支持单端口或端口范围
-  - 默认允许IP为127.0.0.1（仅本机访问）
+  【功能说明】
+  1. 单端口转发：将本地端口转发到目标 IP:端口
+  2. 范围转发：支持 1:1 端口映射，如 2001-2010 -> 3001-3010
+  3. 域名支持：目标地址可使用域名，系统会自动解析并监控 IP 变化
+  4. 端口访问限制：可设置 IP 白名单，限制端口只允许特定 IP 访问
 
-【域名支持】
-  - 目标地址可以输入域名，系统会自动解析为IP
-  - 启动守护进程后，每10分钟自动检查域名IP变化
-  - IP变化时自动更新转发规则
+  【命令行参数】
+  nfter daemon    - 以守护进程模式运行（用于域名监控）
+  nfter start     - 启动域名监控守护进程
+  nfter stop      - 停止守护进程
+  nfter status    - 查看系统状态
 
-【默认值】
-  - 协议默认选择: TCP + UDP（直接回车即可）
-  - 目标端口默认: 与本地端口相同
-  - 端口映射默认: 保持原端口
-  - IP白名单默认: 127.0.0.1
-
-【注意事项】
-  - 需要root权限运行
-  - 修改后建议保存规则，否则重启后失效
-  - IPv6转发需要目标支持IPv6
-  - 确保防火墙允许相关端口的流量
-  - 添加访问限制后，未在白名单的IP将无法访问该端口
-""")
+  【配置文件】
+  /etc/nfter/domains.json  - 域名映射配置
+  /etc/nfter/acl.json      - 访问限制配置
+  /etc/nftables.conf       - nftables 规则配置
+  /var/log/nfter.log       - 运行日志
+    """)
 
 def main_menu():
-    """主菜单"""
     while True:
         print()
         print_color("=" * 60, Colors.CYAN)
@@ -1766,9 +763,9 @@ def main_menu():
         print("  1. 添加单端口转发")
         print("  2. 添加端口范围转发")
         print("  3. 查看当前规则")
-        print("  4. 删除规则")
+        print("  4. 删除单条规则")
         print("  5. 清空所有规则")
-        print("  6. 保存规则")
+        print("  6. 保存规则配置")
         print("  7. 域名监控服务")
         print("  8. 端口访问限制")
         print("  9. 系统状态")
@@ -1776,77 +773,43 @@ def main_menu():
         print("  0. 退出")
         print()
         
-        choice = input(f"{Colors.CYAN}请选择操作 [0-9/h]: {Colors.ENDC}").strip().lower()
+        c = input(f"{Colors.CYAN}请选择: {Colors.ENDC}").strip()
         
-        if choice == '1':
-            add_single_port_forward()
-        elif choice == '2':
-            add_port_range_forward()
-        elif choice == '3':
-            show_rules()
-        elif choice == '4':
-            delete_rule()
-        elif choice == '5':
-            flush_rules()
-        elif choice == '6':
-            save_rules()
-        elif choice == '7':
-            manage_daemon()
-        elif choice == '8':
-            manage_port_acl()
-        elif choice == '9':
-            show_status()
-        elif choice == 'h':
-            show_help()
-        elif choice == '0':
-            print_info("感谢使用，再见！")
-            sys.exit(0)
+        if c == '1': add_single_port_forward()
+        elif c == '2': add_port_range_forward()
+        elif c == '3': print_rules_table(parse_forward_rules())
+        elif c == '4': delete_rule()
+        elif c == '5':
+            if input("输入 'yes' 确认清空: ").lower() == 'yes':
+                run_cmd("nft flush table ip nat"); run_cmd("nft flush table ip6 nat")
+                save_domain_config({"mappings": []}); init_nat_table(); print_success("已清空")
+        elif c == '6': save_rules()
+        elif c == '7':
+            print("\n  1. 启动监控  2. 停止监控  3. 立即更新域名IP")
+            sub = input(f"{Colors.CYAN}  选择: {Colors.ENDC}").strip()
+            if sub == '1': start_daemon()
+            elif sub == '2': stop_daemon()
+            elif sub == '3': update_domain_ip(); print_success("域名IP已更新")
+        elif c == '8': acl_menu()
+        elif c == '9': show_system_status()
+        elif c == 'h' or c == 'H': show_help()
+        elif c == '0': sys.exit(0)
         else:
-            print_error("无效选择，请重试")
+            continue
         
-        input(f"\n{Colors.CYAN}按回车键继续...{Colors.ENDC}")
-
-def main():
-    """主函数"""
-    # 检查命令行参数
-    if len(sys.argv) > 1:
-        cmd = sys.argv[1]
-        if cmd == 'daemon':
-            # 作为守护进程运行
-            check_root()
-            daemon_loop()
-            return
-        elif cmd == 'update':
-            # 手动触发更新
-            check_root()
-            update_domain_ip()
-            return
-        elif cmd == 'start':
-            check_root()
-            start_daemon()
-            return
-        elif cmd == 'stop':
-            check_root()
-            stop_daemon()
-            return
-        elif cmd == 'status':
-            running, pid = daemon_status()
-            if running:
-                print(f"守护进程运行中 (PID: {pid})")
-            else:
-                print("守护进程未运行")
-            return
-    
-    try:
-        check_root()
-        check_nftables()
-        init_nat_table()
-        main_menu()
-        
-    except KeyboardInterrupt:
-        print("\n")
-        print_info("用户中断，退出程序")
-        sys.exit(0)
+        input(f"\n{Colors.DIM}按回车键继续...{Colors.ENDC}")
 
 if __name__ == "__main__":
-    main()
+    check_root(); check_nftables(); init_nat_table(); init_filter_table()
+    
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == 'daemon': start_daemon()
+        elif cmd == 'start': start_daemon()
+        elif cmd == 'stop': stop_daemon()
+        elif cmd == 'status': show_system_status()
+        elif cmd == 'update': update_domain_ip(); print_success("域名IP已更新")
+        else: print_error(f"未知命令: {cmd}")
+    else:
+        try: main_menu()
+        except KeyboardInterrupt: print("\n"); sys.exit(0)
