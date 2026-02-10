@@ -115,21 +115,20 @@ def check_nftables():
 def init_nat_table():
     run_cmd("nft add table ip nat")
     run_cmd("nft add table ip6 nat")
-    run_cmd("nft add chain ip nat prerouting { type nat hook prerouting priority -100 ; }")
-    run_cmd("nft add chain ip nat postrouting { type nat hook postrouting priority 100 ; }")
-    run_cmd("nft add chain ip6 nat prerouting { type nat hook prerouting priority -100 ; }")
-    run_cmd("nft add chain ip6 nat postrouting { type nat hook postrouting priority 100 ; }")
+    run_cmd("nft 'add chain ip nat prerouting { type nat hook prerouting priority -100 ; }'")
+    run_cmd("nft 'add chain ip nat postrouting { type nat hook postrouting priority 100 ; }'")
+    run_cmd("nft 'add chain ip6 nat prerouting { type nat hook prerouting priority -100 ; }'")
+    run_cmd("nft 'add chain ip6 nat postrouting { type nat hook postrouting priority 100 ; }'")
     run_cmd("echo 1 > /proc/sys/net/ipv4/ip_forward")
     run_cmd("echo 1 > /proc/sys/net/ipv6/conf/all/forwarding")
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
 
 def init_filter_table():
-    run_cmd("nft add table ip filter")
-    run_cmd("nft add table ip6 filter")
-    run_cmd("nft add chain ip filter input { type filter hook input priority 0 ; policy accept ; }")
-    run_cmd("nft add chain ip6 filter input { type filter hook input priority 0 ; policy accept ; }")
-    run_cmd("nft add chain ip filter forward { type filter hook forward priority 0 ; policy accept ; }")
-    run_cmd("nft add chain ip6 filter forward { type filter hook forward priority 0 ; policy accept ; }")
+    """初始化 filter 表和链（用于端口访问限制功能）"""
+    for family in ['ip', 'ip6']:
+        run_cmd(f"nft add table {family} filter")
+        run_cmd(f"nft 'add chain {family} filter input {{ type filter hook input priority 0 ; policy accept ; }}'")
+        run_cmd(f"nft 'add chain {family} filter forward {{ type filter hook forward priority 0 ; policy accept ; }}'")
 
 def validate_ip(ip_str):
     try:
@@ -362,6 +361,12 @@ def parse_single_rule(line, version, rid, meta):
 
 # ==================== 端口访问限制 (IP 白名单) ====================
 
+def ensure_filter_chain(tables):
+    """确保指定 family 的 filter 表和 input 链存在（防御性创建）"""
+    for table, _ in tables:
+        run_cmd(f"nft add table {table} filter")
+        run_cmd(f"nft 'add chain {table} filter input {{ type filter hook input priority 0 ; policy accept ; }}'")
+
 def add_acl_rule():
     """添加端口访问限制规则"""
     print_header("添加端口访问限制 (IP 白名单)")
@@ -388,6 +393,9 @@ def add_acl_rule():
     tables = []
     if v_choice in ['1', '3']: tables.append(('ip', 4))
     if v_choice in ['2', '3']: tables.append(('ip6', 6))
+    
+    # 确保 filter 表和 input 链存在
+    ensure_filter_chain(tables)
     
     handles = []
     config = load_acl_config()
