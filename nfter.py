@@ -99,6 +99,23 @@ def run_cmd(cmd, capture=True):
         return result.returncode == 0, result.stdout, result.stderr
     except: return False, "", "Timeout"
 
+def nft(command):
+    """直接调用 nft, 不经过 shell。
+    命令里的 ; { } [ ] 原样交给 nft 解析, 不会被 shell 截断或展开
+    (01-22 版就是因为分号被 shell 截断, 导致 nat 链建不出来)。"""
+    try:
+        result = subprocess.run(["nft", command], capture_output=True, text=True, timeout=30)
+        return result.returncode == 0, result.stdout, result.stderr
+    except Exception as e:
+        return False, "", str(e)
+
+def log_message(msg):
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
+
 def check_root():
     if os.getuid() != 0:
         print_error("需要root权限运行！")
@@ -113,12 +130,12 @@ def check_nftables():
     run_cmd("systemctl enable nftables")
 
 def init_nat_table():
-    run_cmd("nft add table ip nat")
-    run_cmd("nft add table ip6 nat")
-    run_cmd("nft 'add chain ip nat prerouting { type nat hook prerouting priority -100 ; }'")
-    run_cmd("nft 'add chain ip nat postrouting { type nat hook postrouting priority 100 ; }'")
-    run_cmd("nft 'add chain ip6 nat prerouting { type nat hook prerouting priority -100 ; }'")
-    run_cmd("nft 'add chain ip6 nat postrouting { type nat hook postrouting priority 100 ; }'")
+    nft("add table ip nat")
+    nft("add table ip6 nat")
+    nft("add chain ip nat prerouting { type nat hook prerouting priority -100 ; }")
+    nft("add chain ip nat postrouting { type nat hook postrouting priority 100 ; }")
+    nft("add chain ip6 nat prerouting { type nat hook prerouting priority -100 ; }")
+    nft("add chain ip6 nat postrouting { type nat hook postrouting priority 100 ; }")
     run_cmd("echo 1 > /proc/sys/net/ipv4/ip_forward")
     run_cmd("echo 1 > /proc/sys/net/ipv6/conf/all/forwarding")
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
@@ -126,9 +143,9 @@ def init_nat_table():
 def init_filter_table():
     """初始化 filter 表和链（用于端口访问限制功能）"""
     for family in ['ip', 'ip6']:
-        run_cmd(f"nft add table {family} filter")
-        run_cmd(f"nft 'add chain {family} filter input {{ type filter hook input priority 0 ; policy accept ; }}'")
-        run_cmd(f"nft 'add chain {family} filter forward {{ type filter hook forward priority 0 ; policy accept ; }}'")
+        nft(f"add table {family} filter")
+        nft(f"add chain {family} filter input {{ type filter hook input priority 0 ; policy accept ; }}")
+        nft(f"add chain {family} filter forward {{ type filter hook forward priority 0 ; policy accept ; }}")
 
 def validate_ip(ip_str):
     try:
@@ -234,9 +251,9 @@ def remove_mapping_by_handle(handle):
             found = True
             table = "ip" if m.get("ip_version") == 4 else "ip6"
             for h in m.get("dnat_handles", [m.get("handle")]):
-                if h: run_cmd(f"nft delete rule {table} nat prerouting handle {h} 2>/dev/null")
+                if h: nft(f"delete rule {table} nat prerouting handle {h}")
             for h in m.get("masq_handles", []):
-                run_cmd(f"nft delete rule {table} nat postrouting handle {h} 2>/dev/null")
+                nft(f"delete rule {table} nat postrouting handle {h}")
         else:
             new_mappings.append(m)
     if found: save_domain_config({"mappings": new_mappings})
@@ -249,9 +266,9 @@ def update_rule_ip(mapping, new_ip, new_version):
     addr_family = "ip" if new_version == 4 else "ip6"
     
     for h in mapping.get("dnat_handles", [mapping.get("handle")]):
-        if h: run_cmd(f"nft delete rule {table} nat prerouting handle {h} 2>/dev/null")
+        if h: nft(f"delete rule {table} nat prerouting handle {h}")
     for h in mapping.get("masq_handles", []):
-        run_cmd(f"nft delete rule {table} nat postrouting handle {h} 2>/dev/null")
+        nft(f"delete rule {table} nat postrouting handle {h}")
     
     new_d_hs, new_m_hs = [], []
     p_map = ""
@@ -262,20 +279,26 @@ def update_rule_ip(mapping, new_ip, new_version):
     
     for p in protos:
         if new_version == 4:
-            cmd = f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to {new_ip}:{t_port}" if not p_map else f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to {new_ip} : {p} dport map {p_map}"
+            cmd = f"add rule {table} nat prerouting {p} dport {l_port} counter dnat to {new_ip}:{t_port}" if not p_map else f"add rule {table} nat prerouting {p} dport {l_port} counter dnat to {new_ip} : {p} dport map {p_map}"
         else:
-            cmd = f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{new_ip}]:{t_port}" if not p_map else f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{new_ip}] : {p} dport map {p_map}"
+            cmd = f"add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{new_ip}]:{t_port}" if not p_map else f"add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{new_ip}] : {p} dport map {p_map}"
         
-        if run_cmd(cmd)[0]:
+        ok, _, err = nft(cmd)
+        if ok:
             h_out = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{p} dport {l_port}' | grep -oP 'handle \\d+' | tail -1")[1]
             m = re.search(r'handle (\d+)', h_out)
             if m: new_d_hs.append(m.group(1))
+        else:
+            log_message(f"域名 {mapping.get('domain')} 更新 {p.upper()} DNAT 规则失败: {err.strip()}")
         
-        m_cmd = f"nft add rule {table} nat postrouting {addr_family} daddr {new_ip} {p} dport {t_port} counter masquerade"
-        if run_cmd(m_cmd)[0]:
+        m_cmd = f"add rule {table} nat postrouting {addr_family} daddr {new_ip} {p} dport {t_port} counter masquerade"
+        ok, _, err = nft(m_cmd)
+        if ok:
             mh_out = run_cmd(f"nft -a list chain {table} nat postrouting | grep '{p} dport {t_port}' | grep 'daddr {new_ip}' | grep -oP 'handle \\d+' | tail -1")[1]
             mm = re.search(r'handle (\d+)', mh_out)
             if mm: new_m_hs.append(mm.group(1))
+        else:
+            log_message(f"域名 {mapping.get('domain')} 更新 {p.upper()} 伪装规则失败: {err.strip()}")
     
     mapping["dnat_handles"], mapping["masq_handles"] = new_d_hs, new_m_hs
     return len(new_d_hs) > 0
@@ -364,8 +387,8 @@ def parse_single_rule(line, version, rid, meta):
 def ensure_filter_chain(tables):
     """确保指定 family 的 filter 表和 input 链存在（防御性创建）"""
     for table, _ in tables:
-        run_cmd(f"nft add table {table} filter")
-        run_cmd(f"nft 'add chain {table} filter input {{ type filter hook input priority 0 ; policy accept ; }}'")
+        nft(f"add table {table} filter")
+        nft(f"add chain {table} filter input {{ type filter hook input priority 0 ; policy accept ; }}")
 
 def add_acl_rule():
     """添加端口访问限制规则"""
@@ -413,8 +436,8 @@ def add_acl_rule():
             ip_set = "{ " + ", ".join(version_whitelist) + " }"
         
         for proto in protos:
-            allow_cmd = f"nft add rule {table} filter input {proto} dport {port} {addr_family} saddr {ip_set} counter accept"
-            success, _, stderr = run_cmd(allow_cmd)
+            allow_cmd = f"add rule {table} filter input {proto} dport {port} {addr_family} saddr {ip_set} counter accept"
+            success, _, stderr = nft(allow_cmd)
             if success:
                 h_out = run_cmd(f"nft -a list chain {table} filter input | grep '{proto} dport {port}' | grep 'accept' | grep -oP 'handle \\d+' | tail -1")[1]
                 hm = re.search(r'handle (\d+)', h_out)
@@ -423,8 +446,8 @@ def add_acl_rule():
             else:
                 print_error(f"允许规则添加失败: {stderr}")
             
-            drop_cmd = f"nft add rule {table} filter input {proto} dport {port} counter drop"
-            success, _, stderr = run_cmd(drop_cmd)
+            drop_cmd = f"add rule {table} filter input {proto} dport {port} counter drop"
+            success, _, stderr = nft(drop_cmd)
             if success:
                 h_out = run_cmd(f"nft -a list chain {table} filter input | grep '{proto} dport {port}' | grep 'drop' | grep -oP 'handle \\d+' | tail -1")[1]
                 hm = re.search(r'handle (\d+)', h_out)
@@ -499,7 +522,7 @@ def delete_acl_rule():
         chain = h.get('chain', 'input')
         handle = h.get('handle')
         if handle:
-            run_cmd(f"nft delete rule {table} filter {chain} handle {handle} 2>/dev/null")
+            nft(f"delete rule {table} filter {chain} handle {handle}")
     
     rules.pop(int(idx) - 1)
     save_acl_config(config)
@@ -545,25 +568,33 @@ def add_single_port_forward():
     
     for p in protos:
         if v == 4:
-            cmd = f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to {t_ip}:{t_port}"
+            cmd = f"add rule {table} nat prerouting {p} dport {l_port} counter dnat to {t_ip}:{t_port}"
         else:
-            cmd = f"nft add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{t_ip}]:{t_port}"
+            cmd = f"add rule {table} nat prerouting {p} dport {l_port} counter dnat to [{t_ip}]:{t_port}"
         
-        if run_cmd(cmd)[0]:
+        ok, _, err = nft(cmd)
+        if ok:
             h_out = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{p} dport {l_port}' | grep -oP 'handle \\d+' | tail -1")[1]
             dm = re.search(r'handle (\d+)', h_out)
             if dm: d_hs.append(dm.group(1))
+        else:
+            print_error(f"添加 {p.upper()} DNAT 规则失败: {err.strip()}")
         
-        m_cmd = f"nft add rule {table} nat postrouting {addr_family} daddr {t_ip} {p} dport {t_port} counter masquerade"
-        if run_cmd(m_cmd)[0]:
+        m_cmd = f"add rule {table} nat postrouting {addr_family} daddr {t_ip} {p} dport {t_port} counter masquerade"
+        ok, _, err = nft(m_cmd)
+        if ok:
             mh_out = run_cmd(f"nft -a list chain {table} nat postrouting | grep '{p} dport {t_port}' | grep 'daddr {t_ip}' | grep -oP 'handle \\d+' | tail -1")[1]
             mm = re.search(r'handle (\d+)', mh_out)
             if mm: m_hs.append(mm.group(1))
+        else:
+            print_error(f"添加 {p.upper()} 伪装规则失败: {err.strip()}")
             
     if d_hs:
         add_mapping_record(target_in, t_ip, v, l_port, t_port, protos, d_hs, m_hs)
         print_success("规则已添加并同步至数据库")
         if is_domain: start_daemon()
+    else:
+        print_error("没有规则添加成功, 配置未变更")
     save_rules_prompt()
 
 def add_port_range_forward():
@@ -591,28 +622,36 @@ def add_port_range_forward():
     for p in protos:
         if sp == tsp:
             if v == 4:
-                cmd = f"nft add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to {t_ip}"
+                cmd = f"add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to {t_ip}"
             else:
-                cmd = f"nft add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to [{t_ip}]"
+                cmd = f"add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to [{t_ip}]"
         else:
             ip_p = t_ip if v == 4 else f"[{t_ip}]"
-            cmd = f"nft add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to {ip_p} : {p} dport map {p_map}"
+            cmd = f"add rule {table} nat prerouting {p} dport {sp}-{ep} counter dnat to {ip_p} : {p} dport map {p_map}"
         
-        if run_cmd(cmd)[0]:
+        ok, _, err = nft(cmd)
+        if ok:
             h_out = run_cmd(f"nft -a list chain {table} nat prerouting | grep '{p} dport {sp}-{ep}' | grep -oP 'handle \\d+' | tail -1")[1]
             dm = re.search(r'handle (\d+)', h_out)
             if dm: d_hs.append(dm.group(1))
+        else:
+            print_error(f"添加 {p.upper()} DNAT 规则失败: {err.strip()}")
         
-        m_cmd = f"nft add rule {table} nat postrouting {addr_family} daddr {t_ip} {p} dport {tsp}-{tep} counter masquerade"
-        if run_cmd(m_cmd)[0]:
+        m_cmd = f"add rule {table} nat postrouting {addr_family} daddr {t_ip} {p} dport {tsp}-{tep} counter masquerade"
+        ok, _, err = nft(m_cmd)
+        if ok:
             mh_out = run_cmd(f"nft -a list chain {table} nat postrouting | grep '{p} dport {tsp}-{tep}' | grep 'daddr {t_ip}' | grep -oP 'handle \\d+' | tail -1")[1]
             mm = re.search(r'handle (\d+)', mh_out)
             if mm: m_hs.append(mm.group(1))
+        else:
+            print_error(f"添加 {p.upper()} 伪装规则失败: {err.strip()}")
 
     if d_hs:
         add_mapping_record(target_in, t_ip, v, f"{sp}-{ep}", f"{tsp}-{tep}", protos, d_hs, m_hs)
         print_success("1:1 范围映射已添加")
         if is_domain: start_daemon()
+    else:
+        print_error("没有规则添加成功, 配置未变更")
     save_rules_prompt()
 
 def delete_rule():
@@ -630,7 +669,7 @@ def delete_rule():
     
     if not remove_mapping_by_handle(r['handle']):
         table = "ip" if r['ip_version'] == 'IPv4' else "ip6"
-        run_cmd(f"nft delete rule {table} nat prerouting handle {r['handle']} 2>/dev/null")
+        nft(f"delete rule {table} nat prerouting handle {r['handle']}")
         print_success("DNAT 规则已删除")
     else:
         print_success("已连带清理转发记录及伪装规则")
@@ -676,6 +715,17 @@ def daemon_status():
         os.kill(pid, 0); return True, pid
     except: return False, None
 
+def daemon_loop():
+    """域名监控主循环, 前台运行。
+    systemd (Type=simple) 通过 `nfter daemon` 直接调用;
+    菜单/`nfter start` 由 start_daemon 在后台子进程里调用。"""
+    with open(PID_FILE, 'w') as f: f.write(str(os.getpid()))
+    log_message("域名监控守护进程启动")
+    while True:
+        try: update_domain_ip()
+        except Exception as e: log_message(f"域名更新出错: {e}")
+        time.sleep(600)
+
 def start_daemon():
     r, _ = daemon_status()
     if r:
@@ -687,11 +737,7 @@ def start_daemon():
         return
     os.setsid()
     if os.fork() > 0: os._exit(0)
-    with open(PID_FILE, 'w') as f: f.write(str(os.getpid()))
-    while True:
-        try: update_domain_ip()
-        except: pass
-        time.sleep(600)
+    daemon_loop()
 
 def stop_daemon():
     running, pid = daemon_status()
@@ -789,7 +835,7 @@ def main_menu():
         elif c == '4': delete_rule()
         elif c == '5':
             if input("输入 'yes' 确认清空: ").lower() == 'yes':
-                run_cmd("nft flush table ip nat"); run_cmd("nft flush table ip6 nat")
+                nft("flush table ip nat"); nft("flush table ip6 nat")
                 save_domain_config({"mappings": []}); init_nat_table(); print_success("已清空")
         elif c == '6': save_rules()
         elif c == '7':
@@ -812,7 +858,13 @@ if __name__ == "__main__":
     
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
-        if cmd == 'daemon': start_daemon()
+        if cmd == 'daemon':
+            # systemd 模式: 前台运行。若菜单启动的后台监控还在, 由 systemd 接管, 避免两个实例同时改规则
+            running, pid = daemon_status()
+            if running and pid != os.getpid():
+                try: os.kill(pid, signal.SIGTERM)
+                except Exception: pass
+            daemon_loop()
         elif cmd == 'start': start_daemon()
         elif cmd == 'stop': stop_daemon()
         elif cmd == 'status': show_system_status()

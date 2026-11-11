@@ -32,12 +32,32 @@
 curl -fsSL https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh | sudo bash
 
 # 一键安装并运行(中国大陆加速）
-curl -fsSL https://ghproxy.cfd/raw.githubusercontent.com/Yorkian/Nfter/main/nftercn.sh | sudo bash
+curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/Yorkian/Nfter/main/nftercn.sh | sudo bash
 
 # 或下载后运行
 wget https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh
 sudo bash nfter.sh
 ```
+
+> ⚠️ **安全提示**：旧的加速域名 `ghproxy.cfd` 已于 2026-11 被他人抢注，现在返回的是无关网页。
+> 请勿再运行任何包含 `ghproxy.cfd` 的命令，请改用上面的新命令。
+
+## 升级
+
+已安装的用户再次运行一键安装命令只会进入菜单，不会更新程序。升级请在命令末尾加 `update`：
+
+```bash
+# 升级到最新版
+curl -fsSL https://raw.githubusercontent.com/Yorkian/Nfter/main/nfter.sh | sudo bash -s -- update
+
+# 升级到最新版(中国大陆加速）
+curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/Yorkian/Nfter/main/nftercn.sh | sudo bash -s -- update
+
+# 或下载脚本后运行
+sudo bash nfter.sh update
+```
+
+升级只替换 `/usr/local/bin/nfter` 和 systemd 服务文件，不会改动 `/etc/nfter/` 下的配置和 `/etc/nftables.conf`。
 
 ## 使用方法
 
@@ -229,6 +249,8 @@ sudo nft -f /etc/nftables.conf
 ## 加速支持
 
 https://ghproxy.net/
+
+安装脚本会校验下载内容，加速源失效时会直接报错退出，不会把网页当成程序安装。
 
 ## 许可证
 

@@ -12,8 +12,10 @@ NC='\033[0m'
 
 SERVICE_FILE="/etc/systemd/system/nfter.service"
 BIN_FILE="/usr/local/bin/nfter"
-#GITHUB_BASE="https://raw.githubusercontent.com/Yorkian/Nfter/main" 
-GITHUB_BASE="https://ghproxy.cfd/raw.githubusercontent.com/Yorkian/Nfter/main" #开启中国加速
+#GITHUB_BASE="https://raw.githubusercontent.com/Yorkian/Nfter/main"
+GITHUB_BASE="https://ghproxy.net/https://raw.githubusercontent.com/Yorkian/Nfter/main" #开启中国加速
+# 注意: 旧加速域名 ghproxy.cfd 已于 2026-11 被他人抢注, 切勿再使用
+SCRIPT_NAME="nftercn.sh"
 
 
 # 检查是否通过管道运行
@@ -43,7 +45,7 @@ check_installed() {
 # 安装程序
 install_nfter() {
     echo -e "${CYAN}========================================${NC}"
-    echo -e "${CYAN}  nfter 安装程序${NC}"
+    echo -e "${CYAN}  nfter 安装/升级程序${NC}"
     echo -e "${CYAN}========================================${NC}"
     echo
 
@@ -111,42 +113,58 @@ install_nfter() {
         DOWNLOADER="curl -fsSL -o"
     fi
 
+    # 下载到临时目录, 不碰当前目录里的同名文件
+    TMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$TMP_DIR"' EXIT
+
     # 下载主程序
-    $DOWNLOADER nfter.py "$GITHUB_BASE/nfter.py"
-    if [ $? -ne 0 ]; then
+    if ! $DOWNLOADER "$TMP_DIR/nfter.py" "$GITHUB_BASE/nfter.py"; then
         echo -e "${RED}✗ 下载 nfter.py 失败${NC}"
+        exit 1
+    fi
+    # 校验内容: 下载源失效时常返回 HTTP 200 的网页, 不校验会把网页当程序装上
+    if ! head -n 1 "$TMP_DIR/nfter.py" | grep -q '^#!/usr/bin/env python3' || \
+       ! python3 -m py_compile "$TMP_DIR/nfter.py" 2>/dev/null; then
+        echo -e "${RED}✗ nfter.py 内容异常, 下载源可能已失效: $GITHUB_BASE${NC}"
         exit 1
     fi
     echo -e "${GREEN}✓ nfter.py 下载完成${NC}"
 
     # 下载服务文件
-    $DOWNLOADER nfter.service "$GITHUB_BASE/nfter.service"
-    if [ $? -ne 0 ]; then
+    if ! $DOWNLOADER "$TMP_DIR/nfter.service" "$GITHUB_BASE/nfter.service"; then
         echo -e "${RED}✗ 下载 nfter.service 失败${NC}"
-        rm -f nfter.py
+        exit 1
+    fi
+    if ! grep -q '^\[Unit\]' "$TMP_DIR/nfter.service" || \
+       ! grep -q '^ExecStart=' "$TMP_DIR/nfter.service"; then
+        echo -e "${RED}✗ nfter.service 内容异常, 下载源可能已失效: $GITHUB_BASE${NC}"
         exit 1
     fi
     echo -e "${GREEN}✓ nfter.service 下载完成${NC}"
 
     # 安装主程序
     echo -e "${GREEN}[6/7] 安装nfter...${NC}"
-    cp nfter.py "$BIN_FILE"
+    cp "$TMP_DIR/nfter.py" "$BIN_FILE"
     chmod +x "$BIN_FILE"
     mkdir -p /etc/nfter
     echo -e "${GREEN}✓ nfter 已安装到 $BIN_FILE${NC}"
 
     # 安装systemd服务
     echo -e "${GREEN}[7/7] 安装域名监控服务...${NC}"
-    cp nfter.service "$SERVICE_FILE"
+    cp "$TMP_DIR/nfter.service" "$SERVICE_FILE"
     systemctl daemon-reload
+    # 升级时若域名监控服务在运行, 重启以加载新版本
+    if systemctl is-active --quiet nfter; then
+        systemctl restart nfter
+    fi
     echo -e "${GREEN}✓ systemd 服务已安装${NC}"
 
-    # 清理下载的文件
-    rm -f nfter.py nfter.service
+    # 清理临时文件 (后面的 exec 不会触发 EXIT trap, 这里显式删除)
+    rm -rf "$TMP_DIR"
 
     echo
     echo -e "${CYAN}========================================${NC}"
-    echo -e "${CYAN}  安装完成！${NC}"
+    echo -e "${CYAN}  安装/升级完成！${NC}"
     echo -e "${CYAN}========================================${NC}"
     echo
     echo "使用方法:"
@@ -174,8 +192,12 @@ install_nfter() {
 main() {
     check_root
     
-    if check_installed; then
+    if [ "$1" = "update" ] || [ "$1" = "upgrade" ]; then
+        # 强制重新下载并覆盖安装 (升级)
+        install_nfter
+    elif check_installed; then
         # 已安装，直接运行nfter
+        echo -e "${CYAN}提示: 升级到最新版请运行 curl -fsSL $GITHUB_BASE/$SCRIPT_NAME | sudo bash -s -- update${NC}"
         if is_pipe_mode; then
             # 管道模式下重定向输入到终端
             exec "$BIN_FILE" </dev/tty
@@ -188,4 +210,4 @@ main() {
     fi
 }
 
-main
+main "$@"
